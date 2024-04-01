@@ -3,12 +3,14 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy.stats import mannwhitneyu, chi2_contingency, ttest_ind
+
 # automated feature engineering
 import featuretools as ft
 
 # Filter out pandas warnings
-import warnings 
-warnings.filterwarnings('ignore')
+import warnings
+
+warnings.filterwarnings("ignore")
 
 start = "\033[1m"  # Bold text
 end = "\033[0;0m"  # Reset text
@@ -37,11 +39,14 @@ def clean_feature_names(dataframe):
     - pd.DataFrame, the cleaned dataframe.
     """
     # Replace or remove special JSON characters
-    clean_names = {name: name.replace('{', '_').replace('}', '_').replace(':', '_').replace(',', '_').replace('"', '') for name in dataframe.columns}
+    clean_names = {
+        name: name.replace("{", "_")
+        .replace("}", "_")
+        .replace(":", "_")
+        .replace(",", "_")
+        .replace('"', "")
+        for name in dataframe.columns
+    }
     # Rename the columns in the DataFrame
     dataframe.rename(columns=clean_names, inplace=True)
     return dataframe
-
-
-
-
