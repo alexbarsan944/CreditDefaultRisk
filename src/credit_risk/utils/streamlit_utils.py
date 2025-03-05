@@ -267,9 +267,14 @@ def load_step_data(step_name: str, specific_file: str = None) -> Any:
         st.error(f"Error loading data: {str(e)}")
         return None
 
-def get_available_step_data() -> Dict:
+def get_available_step_data(step_name: str = None) -> Dict:
     """
     Get a list of all available saved step data, including metadata about the files
+    
+    Parameters:
+    -----------
+    step_name : str, optional
+        If provided, only return data for this specific step
     
     Returns:
     --------
@@ -291,7 +296,12 @@ def get_available_step_data() -> Dict:
         meta_files = [f for f in all_files if f.endswith('.meta')]
         logger.info(f"Found {len(meta_files)} metadata files")
         
-        # Specifically check for feature_selection files
+        # If step_name is provided, filter files by step name
+        if step_name:
+            meta_files = [f for f in meta_files if f.startswith(f'{step_name}_')]
+            logger.info(f"Found {len(meta_files)} {step_name} metadata files")
+        
+        # Specifically check for feature_selection files (for logging/debugging)
         feature_selection_files = [f for f in meta_files if f.startswith('feature_selection_')]
         logger.info(f"Found {len(feature_selection_files)} feature_selection metadata files")
         
@@ -308,12 +318,16 @@ def get_available_step_data() -> Dict:
                 with open(meta_file, "r") as f:
                     metadata = json.load(f)
                     
-                step_name = metadata.get("step_name")
-                logger.info(f"Processing metadata for step: {step_name}, file: {meta_filename}")
+                current_step_name = metadata.get("step_name")
+                logger.info(f"Processing metadata for step: {current_step_name}, file: {meta_filename}")
                 
-                # Create entry for step_name if it doesn't exist
-                if step_name not in result:
-                    result[step_name] = []
+                # Skip if we're filtering by step_name and this doesn't match
+                if step_name and current_step_name != step_name:
+                    continue
+                
+                # Create entry for current_step_name if it doesn't exist
+                if current_step_name not in result:
+                    result[current_step_name] = []
                     
                 # Check if the data file exists
                 data_file_path = metadata.get("filepath")
@@ -323,9 +337,9 @@ def get_available_step_data() -> Dict:
                 metadata["file_exists"] = file_exists
                 
                 # Log more detailed info about the file
-                logger.info(f"Metadata file: {meta_filename}, Data file exists: {file_exists}, Step: {step_name}")
+                logger.info(f"Metadata file: {meta_filename}, Data file exists: {file_exists}, Step: {current_step_name}")
                 
-                if step_name == "feature_selection":
+                if current_step_name == "feature_selection":
                     if file_exists:
                         file_size = os.path.getsize(data_file_path)
                         logger.info(f"Feature selection file exists at {data_file_path} with size {file_size} bytes")
@@ -333,7 +347,7 @@ def get_available_step_data() -> Dict:
                         logger.warning(f"Feature selection data file does NOT exist at {data_file_path}")
                 
                 # Append metadata to result
-                result[step_name].append(metadata)
+                result[current_step_name].append(metadata)
             
             except json.JSONDecodeError:
                 logger.error(f"Error decoding metadata file {meta_filename}")
@@ -341,8 +355,8 @@ def get_available_step_data() -> Dict:
                 logger.error(f"Error processing metadata file {meta_filename}: {str(e)}", exc_info=True)
         
         # Sort metadata by timestamp (most recent first)
-        for step_name in result:
-            result[step_name] = sorted(result[step_name], key=lambda x: x.get("timestamp", ""), reverse=True)
+        for step in result:
+            result[step] = sorted(result[step], key=lambda x: x.get("timestamp", ""), reverse=True)
             
         # Check for feature_selection results
         if "feature_selection" in result and result["feature_selection"]:
@@ -350,8 +364,19 @@ def get_available_step_data() -> Dict:
             # Log details of each result
             for i, meta in enumerate(result["feature_selection"]):
                 logger.info(f"Feature selection result {i+1}: {meta.get('timestamp')} - {meta.get('description')}")
-        else:
+        elif step_name == "feature_selection":
             logger.warning(f"No feature_selection results found")
+            
+        # If step_name is provided, convert the result to a more convenient format
+        if step_name and step_name in result:
+            # Convert to a dictionary mapping timestamp to description
+            simplified_result = {}
+            for meta in result[step_name]:
+                timestamp = meta.get("timestamp", "")
+                description = meta.get("description", f"{step_name} data")
+                if timestamp:
+                    simplified_result[timestamp] = description
+            return simplified_result
             
         return result
     except Exception as e:

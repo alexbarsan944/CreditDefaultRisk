@@ -41,519 +41,524 @@ def render_feature_selection_tab(data: pd.DataFrame):
         Data to perform feature selection on
     """
     st.header("Feature Selection")
-    st.write(
-        """
-        This tab allows you to perform feature selection using the null importance method.
-        The null importance method identifies important features by comparing their importance in the original data
-        with their importance when the target variable is randomly permuted.
-        """
-    )
     
-    # Check if data is loaded
-    if data is None or data.empty:
-        st.warning("No data loaded. Please load data first.")
-        return
-    
-    # Save button for original data
-    st.sidebar.subheader("Save/Load Data")
-    save_col1, save_col2 = st.sidebar.columns(2)
-    
-    with save_col1:
-        if st.button("💾 Save Input Data", key="save_input_data"):
-            with st.spinner("Saving input data..."):
-                try:
-                    description = f"Input data with {data.shape[1]} features for feature selection"
-                    filepath = save_step_data("feature_engineering", data, description)
-                    if filepath:
-                        st.success(f"Input data saved successfully! Path: {filepath}")
-                        logger.info(f"Input data saved to {filepath}")
-                    else:
-                        st.error("Failed to save input data. Check logs for details.")
-                        logger.error("Failed to save input data")
-                except Exception as e:
-                    st.error(f"Error saving input data: {str(e)}")
-                    logger.error(f"Error saving input data: {str(e)}", exc_info=True)
-    
-    # Load data from previous steps
-    try:
-        available_data = get_available_step_data()
-        if "feature_engineering" in available_data and available_data["feature_engineering"]:
-            st.sidebar.subheader("Load Previous Data")
-            data_options = [f"{item['timestamp']} - {item['description']}" for item in available_data["feature_engineering"]]
+    # Educational content in an expander
+    with st.expander("About Feature Selection", expanded=False):
+        st.markdown(
+            """
+            ### Why Feature Selection Matters
             
-            if data_options:
-                selected_data_idx = st.sidebar.selectbox(
-                    "Select data to load:", 
-                    range(len(data_options)), 
-                    format_func=lambda i: data_options[i]
-                )
-                
-                if st.sidebar.button("📂 Load Selected Data"):
-                    with st.spinner("Loading data..."):
-                        try:
-                            selected_metadata = available_data["feature_engineering"][selected_data_idx]
-                            if "filepath" in selected_metadata:
-                                filepath = selected_metadata["filepath"]
-                            else:
-                                filepath = str(DATA_DIR / selected_metadata["filename"])
-                                
-                            logger.info(f"Attempting to load data from {filepath}")
-                            loaded_data = load_step_data("feature_engineering", specific_file=filepath)
-                            
-                            if loaded_data is not None:
-                                data = loaded_data
-                                st.sidebar.success(f"Data loaded successfully! {data.shape[0]} rows, {data.shape[1]} columns")
-                                st.rerun()
-                            else:
-                                st.sidebar.error("Failed to load data. Check logs for details.")
-                        except Exception as e:
-                            st.sidebar.error(f"Error loading data: {str(e)}")
-                            logger.error(f"Error loading data: {str(e)}", exc_info=True)
-    except Exception as e:
-        logger.error(f"Error getting available data: {str(e)}", exc_info=True)
-        st.sidebar.error(f"Error retrieving saved data: {str(e)}")
-    
-    # Check if TARGET column exists
-    if "TARGET" not in data.columns:
-        st.error("TARGET column not found in the data. Please make sure your data contains a TARGET column.")
-        return
-    
-    st.write(f"Data loaded with {data.shape[0]} rows and {data.shape[1]} columns.")
-    
-    # Settings for feature selection
-    st.subheader("Feature Selection Settings")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        test_size = st.slider(
-            "Test set size (%)",
-            min_value=10,
-            max_value=50,
-            value=20,
-            step=5,
-            help="Percentage of data to use for testing",
-            key="feature_selection_test_size"
-        ) / 100
-        
-        n_runs = st.slider(
-            "Number of null importance runs",
-            min_value=5,
-            max_value=50,
-            value=20,
-            step=5,
-            help="More runs give more stable results but take longer",
-            key="feature_selection_n_runs"
-        )
-        
-        # Add GPU options
-        use_gpu = st.checkbox(
-            "Use GPU for XGBoost (if available)",
-            value=True,
-            help="Enable GPU acceleration for faster feature selection",
-            key="feature_selection_use_gpu"
-        )
-    
-    with col2:
-        use_auto_thresholds = st.checkbox(
-            "Use automatic threshold detection",
-            value=True,
-            help="Automatically determine optimal thresholds for feature selection",
-            key="feature_selection_auto_thresholds"
-        )
-        
-        if not use_auto_thresholds:
-            split_score_threshold = st.slider(
-                "Split score threshold",
-                min_value=0.0,
-                max_value=1.0,
-                value=0.05,
-                step=0.05,
-                help="Higher values keep fewer features (more strict)",
-                key="feature_selection_split_score_threshold"
-            )
+            Feature selection helps improve model performance by:
+            - **Reducing Overfitting**: Fewer features can lead to more generalizable models
+            - **Improving Performance**: Removing noise can increase prediction accuracy
+            - **Faster Training**: Fewer features means faster model training
+            - **Better Interpretability**: Models with fewer features are easier to understand
             
-            gain_score_threshold = st.slider(
-                "Gain score threshold",
-                min_value=0.0,
-                max_value=1.0,
-                value=0.05,
-                step=0.05,
-                help="Higher values keep fewer features (more strict)",
-                key="feature_selection_gain_score_threshold"
-            )
+            ### Methods Used
             
-            correlation_threshold = st.slider(
-                "Correlation threshold",
-                min_value=0.70,
-                max_value=0.99,
-                value=0.95,
-                step=0.01,
-                help="Features with correlation above this value will be removed",
-                key="feature_selection_correlation_threshold"
-            )
-        else:
-            st.info("Thresholds will be determined automatically based on the feature importance distributions.")
-            # Set thresholds to None to trigger automatic detection
-            split_score_threshold = None
-            gain_score_threshold = None
-            correlation_threshold = None
-    
-    random_state = st.number_input(
-        "Random seed",
-        min_value=1,
-        max_value=100000,
-        value=42,
-        help="Random seed for reproducibility",
-        key="feature_selection_random_state"
-    )
-    
-    # Run button
-    if st.button("Run Feature Selection", type="primary", key="run_feature_selection"):
-        # Split features and target
-        X = data.drop(columns=["TARGET"])
-        y = data["TARGET"]
-        
-        # Log data information for debugging
-        st.write(f"Data shape: {X.shape}")
-        st.write(f"Target distribution: {y.value_counts().to_dict()}")
-        
-        # Split into train and test sets
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=test_size, random_state=random_state, stratify=y
+            This tab implements the **Null Importance Method**:
+            
+            1. Train a model on the real data and record feature importances
+            2. Shuffle the target variable to break its relationship with features
+            3. Train models on this "null" data multiple times
+            4. Compare real importances vs. null importance distribution
+            5. Select features where real importance significantly exceeds null importances
+            
+            This method is particularly effective for identifying features that have a genuine relationship with the target.
+            """
         )
         
-        st.write(f"Train set: {X_train.shape[0]} samples, Test set: {X_test.shape[0]} samples")
-        
-        # Create progress bar
-        progress_bar = st.progress(0, "Starting feature selection...")
-        
+        # Simple diagram explaining null importance
         try:
-            start_time = time.time()
-            
-            # Log that we're running feature selection with GPU if enabled
-            if use_gpu:
-                st.info("Running feature selection with GPU support (if available)")
-                logger.info("Running feature selection with GPU support")
-            else:
-                st.info("Running feature selection without GPU support")
-                logger.info("Running feature selection without GPU support")
-            
-            # Perform feature selection
-            X_train_selected, feature_selector, results = perform_feature_selection(
-                X_train, 
-                y_train,
-                n_runs=n_runs,
-                split_score_threshold=split_score_threshold,
-                gain_score_threshold=gain_score_threshold,
-                correlation_threshold=correlation_threshold,
-                random_state=random_state,
-                progress_bar=progress_bar,
-                use_gpu=use_gpu
-            )
-            
-            X_test_selected = feature_selector.transform(X_test)
-            
-            elapsed_time = time.time() - start_time
-            
-            st.success(f"Feature selection completed in {elapsed_time:.2f} seconds!")
-            
-            # Show thresholds used (automatically determined or manually set)
-            if use_auto_thresholds:
-                st.info(f"""
-                Automatically determined thresholds:
-                - Split score threshold: {feature_selector.split_score_threshold_:.3f}
-                - Gain score threshold: {feature_selector.gain_score_threshold_:.3f}
-                - Correlation threshold: {feature_selector.correlation_threshold_:.3f}
-                """)
-            
-            # Store results in session state for use in model training
-            st.session_state.feature_selection_results = {
-                "X_train": X_train_selected,
-                "X_test": X_test_selected,
-                "y_train": y_train,
-                "y_test": y_test,
-                "feature_selector": feature_selector,
-                "feature_scores": results["feature_scores"],
-                "original_features": results["original_features"],
-                "selected_features": results["selected_features"]
-            }
-            
-            # Display results
-            st.subheader("Feature Selection Results")
-            
-            # Show metrics in columns
-            col1, col2, col3 = st.columns(3)
-            
-            with col1:
-                st.metric(
-                    "Original Features", 
-                    f"{results['original_features']}",
-                    help="Number of features before selection"
-                )
-            
-            with col2:
-                st.metric(
-                    "Selected Features", 
-                    f"{results['selected_features']}",
-                    f"-{results.get('reduction_percentage', 0.0):.1f}%",
-                    help="Number of features after selection"
-                )
-            
-            with col3:
-                percent_kept = 100 - results.get('reduction_percentage', 0.0)
-                st.metric(
-                    "Features Kept", 
-                    f"{percent_kept:.1f}%",
-                    help="Percentage of original features kept"
-                )
-            
-            # Create feature score plots
-            plots = create_feature_score_plots(results["feature_scores"])
-            
-            # Display plots in tabs
-            plot_tabs = st.tabs(["Top Features", "Bottom Features", "Score Distributions"])
-            
-            with plot_tabs[0]:
-                st.subheader("Top Features by Score")
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    st.plotly_chart(plots["top_split"], use_container_width=True)
-                
-                with col2:
-                    st.plotly_chart(plots["top_gain"], use_container_width=True)
-            
-            with plot_tabs[1]:
-                st.subheader("Bottom Features by Score")
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    st.plotly_chart(plots["bottom_split"], use_container_width=True)
-                
-                with col2:
-                    st.plotly_chart(plots["bottom_gain"], use_container_width=True)
-            
-            with plot_tabs[2]:
-                st.subheader("Score Distributions")
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    st.plotly_chart(plots["split_distribution"], use_container_width=True)
-                
-                with col2:
-                    st.plotly_chart(plots["gain_distribution"], use_container_width=True)
-            
-            # Display feature selection results
-            with st.expander("Selected Features List", expanded=False):
-                st.write(f"Selected {len(feature_selector.get_useful_features())} features out of {X_train.shape[1]} original features")
-                
-                # Create a more informative selected features dataframe
-                selected_features = feature_selector.get_useful_features()
-                selected_features_df = results["feature_scores"][results["feature_scores"]["feature"].isin(selected_features)]
-                selected_features_df = selected_features_df.sort_values("split_score", ascending=False)
-                
-                # Add an index column to display rank
-                selected_features_df = selected_features_df.reset_index(drop=True)
-                selected_features_df.index = selected_features_df.index + 1
-                selected_features_df = selected_features_df.rename_axis("Rank")
-                
-                st.dataframe(prepare_dataframe_for_streamlit(selected_features_df))
-            
-            # Display feature scores
-            with st.expander("All Feature Scores", expanded=False):
-                all_scores_df = results["feature_scores"].sort_values("split_score", ascending=False).reset_index(drop=True)
-                all_scores_df.index = all_scores_df.index + 1
-                all_scores_df = all_scores_df.rename_axis("Rank")
-                st.dataframe(prepare_dataframe_for_streamlit(all_scores_df))
-            
-            # Save feature selection results
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                save_button = st.button("💾 Save Selected Features", 
-                              key="save_feature_selection",
-                              help="Save the selected features for use in model training")
-                
-                if save_button:
-                    with st.spinner("Saving selected features..."):
-                        try:
-                            # Save the entire dataset with only selected features and target
-                            selected_features = feature_selector.get_useful_features()
-                            selected_data = data[selected_features + ["TARGET"]]
-                            
-                            # Save data with explicit step name
-                            description = f"Selected {len(selected_features)} features out of {X_train.shape[1]} original features"
-                            
-                            # Explicitly print what we're trying to save
-                            logger.info(f"Attempting to save feature selection data with {len(selected_features)} features")
-                            
-                            # Prepare the data to save
-                            save_data = {
-                                "data": selected_data,
-                                "feature_selector": feature_selector,
-                                "results": results,
-                                "X_train": X_train[selected_features],
-                                "X_test": X_test[selected_features],
-                                "y_train": y_train,
-                                "y_test": y_test,
-                                "selected_features": selected_features,
-                                "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S")
-                            }
-                            
-                            # Log the keys in the save_data for debugging
-                            logger.info(f"Save data contains keys: {list(save_data.keys())}")
-                            
-                            # Check if the data directory exists
-                            if not os.path.exists(DATA_DIR):
-                                logger.error(f"Data directory does not exist: {DATA_DIR}")
-                                os.makedirs(DATA_DIR, exist_ok=True)
-                                logger.info(f"Created data directory: {DATA_DIR}")
-                            else:
-                                logger.info(f"Data directory exists: {DATA_DIR}")
-                            
-                            # Debug the filepath before saving
-                            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                            expected_filename = f"feature_selection_{timestamp}.pkl"
-                            expected_filepath = os.path.join(DATA_DIR, expected_filename)
-                            logger.info(f"Expected filepath for saving: {expected_filepath}")
-                            
-                            # Save to feature_selection step (NOT feature_engineering)
-                            logger.info(f"About to save feature_selection data with description: '{description}'")
-                            filepath = save_step_data("feature_selection", save_data, description)
-                            logger.info(f"Returned filepath after save_step_data: {filepath}")
-                            
-                            if filepath:
-                                # Verify the file actually exists
-                                if os.path.exists(filepath):
-                                    file_size = os.path.getsize(filepath)
-                                    logger.info(f"Verified file exists: {filepath} (Size: {file_size} bytes)")
-                                    
-                                    # Also verify the metadata file
-                                    metadata_path = f"{filepath}.meta"
-                                    if os.path.exists(metadata_path):
-                                        metadata_size = os.path.getsize(metadata_path)
-                                        logger.info(f"Verified metadata file exists: {metadata_path} (Size: {metadata_size} bytes)")
-                                        
-                                        # Read the metadata to confirm it's correct
-                                        try:
-                                            import json
-                                            with open(metadata_path, 'r') as f:
-                                                metadata = json.load(f)
-                                            logger.info(f"Successfully read metadata: {metadata}")
-                                            
-                                            # Check available data after saving
-                                            available_data_after_save = get_available_step_data()
-                                            if "feature_selection" in available_data_after_save:
-                                                logger.info(f"Feature selection data found in available_data after saving!")
-                                                logger.info(f"Found {len(available_data_after_save['feature_selection'])} feature selection entries")
-                                            else:
-                                                logger.warning("Feature selection not found in available_data even after saving!")
-                                                
-                                        except Exception as e:
-                                            logger.error(f"Error reading metadata: {str(e)}", exc_info=True)
-                                    else:
-                                        logger.error(f"Metadata file does NOT exist: {metadata_path}")
-                                    
-                                    st.success(f"Selected features saved successfully as feature_selection data!")
-                                    st.info(f"You can now go to the Model Training tab to train a model using these features.")
-                                    logger.info(f"Feature selection results saved to {filepath}")
-                                else:
-                                    logger.error(f"File does NOT exist after save: {filepath}")
-                                    st.error("Failed to save feature selection results. File not created.")
-                            else:
-                                logger.error("Failed to save feature selection results. No filepath returned.")
-                                st.error("Failed to save feature selection results.")
-                        except Exception as e:
-                            st.error(f"Error saving selected features: {str(e)}")
-                            logger.error(f"Error saving feature selection results: {str(e)}", exc_info=True)
-                            
-            with col2:
-                st.markdown("""
-                ⚠️ **Important**: After saving the selected features, go to the 
-                **Model Training** tab to train a model using these features.
-                """)
-            
-            # Next steps guidance
-            st.info("🔍 **Next Steps**: Proceed to the Model Training tab to train a model using these selected features. Your feature selection results have been saved.")
-            
-        except Exception as e:
-            st.error(f"Error during feature selection: {str(e)}")
-            logger.error(f"Feature selection error: {str(e)}", exc_info=True)
+            st.image("https://i.imgur.com/XXvAYKA.png", caption="Null Importance Method", use_column_width=True)
+        except:
+            st.write("Null importance compares feature importance between real data and randomized target data.")
+        
+    # Check if we have data to work with
+    if data is None:
+        st.warning("No feature data available. Please run Feature Engineering first.")
+        return
     
-    # If we already have feature selection results, show a summary
-    elif "feature_selection_results" in st.session_state:
-        results = st.session_state.feature_selection_results
+    # Show existing results or run new feature selection
+    feature_selection_results = st.session_state.get("feature_selection_results")
+    
+    if feature_selection_results is None:
+        # Check for existing saved feature selection results
+        available_data = get_available_step_data("feature_selection")
         
-        st.success(f"Feature selection completed previously.")
-        
-        # Display results summary
-        st.subheader("Feature Selection Results")
-        
-        # Show metrics in columns
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            st.metric(
-                "Original Features", 
-                f"{results['original_features']}",
-                help="Number of features before selection"
+        if available_data:
+            st.info("Found existing feature selection results. You can load them or run a new selection.")
+            
+            # Create selectbox for available feature selection results
+            result_options = []
+            for timestamp, description in available_data.items():
+                result_options.append(f"{timestamp} - {description}")
+            
+            selected_result = st.selectbox(
+                "Load existing feature selection",
+                options=result_options,
+                help="Select previously saved feature selection results to load"
             )
+            
+            if st.button("Load Selected Results"):
+                with st.spinner("Loading feature selection results..."):
+                    # Extract timestamp from selection
+                    timestamp = selected_result.split(" - ")[0]
+                    feature_selection_results = load_step_data("feature_selection", timestamp)
+                    st.session_state["feature_selection_results"] = feature_selection_results
+                    st.success("Feature selection results loaded successfully!")
+                    st.rerun()
         
-        with col2:
-            st.metric(
-                "Selected Features", 
-                f"{results['selected_features']}",
-                f"-{results.get('reduction_percentage', 0.0):.1f}%",
-                help="Number of features after selection"
+        # Create tabs for new feature selection
+        feature_tabs = st.tabs(["Basic Settings", "Advanced Settings", "Run Feature Selection"])
+        
+        # Basic Settings tab
+        with feature_tabs[0]:
+            st.subheader("Basic Feature Selection Settings")
+            
+            # Basic parameters with helpful explanations
+            base_col1, base_col2 = st.columns(2)
+            
+            with base_col1:
+                selection_method = st.selectbox(
+                    "Feature Selection Method",
+                    options=["null_importance", "feature_importance"],
+                    index=0,
+                    help="Null importance is more robust but takes longer to run"
+                )
+                
+                test_size = st.slider(
+                    "Test Size",
+                    min_value=0.1,
+                    max_value=0.5,
+                    value=0.2,
+                    step=0.05,
+                    help="Percentage of data to use for validation"
+                )
+            
+            with base_col2:
+                correlation_threshold = st.slider(
+                    "Correlation Threshold",
+                    min_value=0.0,
+                    max_value=1.0,
+                    value=0.8,
+                    step=0.05,
+                    help="Remove highly correlated features above this threshold"
+                )
+                
+                random_seed = st.number_input(
+                    "Random Seed",
+                    min_value=1,
+                    max_value=9999,
+                    value=42,
+                    help="Random seed for reproducibility"
+                )
+        
+        # Advanced Settings tab
+        with feature_tabs[1]:
+            st.subheader("Advanced Feature Selection Settings")
+            
+            # Only show null importance settings if that method is selected
+            if selection_method == "null_importance":
+                adv_col1, adv_col2 = st.columns(2)
+                
+                with adv_col1:
+                    n_runs = st.slider(
+                        "Number of Null Runs",
+                        min_value=5,
+                        max_value=100,
+                        value=20,
+                        step=5,
+                        help="More runs give more reliable results but take longer"
+                    )
+                    
+                    threshold_method = st.selectbox(
+                        "Threshold Method",
+                        options=["percentile", "standard_deviation", "threshold"],
+                        index=0,
+                        help="Method to determine the importance threshold"
+                    )
+                
+                with adv_col2:
+                    if threshold_method == "percentile":
+                        threshold_value = st.slider(
+                            "Percentile Threshold",
+                            min_value=80,
+                            max_value=99,
+                            value=95,
+                            step=1,
+                            help="Percentile of null importance distribution to use as threshold"
+                        )
+                    elif threshold_method == "standard_deviation":
+                        threshold_value = st.slider(
+                            "Standard Deviation Multiplier",
+                            min_value=1.0,
+                            max_value=5.0,
+                            value=2.0,
+                            step=0.1,
+                            help="Number of standard deviations above mean null importance"
+                        )
+                    else:  # threshold
+                        threshold_value = st.slider(
+                            "Absolute Threshold",
+                            min_value=0.0,
+                            max_value=1.0,
+                            value=0.1,
+                            step=0.01,
+                            help="Absolute importance score threshold"
+                        )
+            else:
+                # Simple feature importance settings
+                importance_threshold = st.slider(
+                    "Importance Threshold",
+                    min_value=0.0,
+                    max_value=0.1,
+                    value=0.005,
+                    step=0.001,
+                    help="Minimum importance score to keep a feature"
+                )
+                n_runs = 1
+                threshold_method = "threshold"
+                threshold_value = importance_threshold
+            
+            # Feature prefiltering
+            st.subheader("Feature Prefiltering")
+            prefilter_col1, prefilter_col2 = st.columns(2)
+            
+            with prefilter_col1:
+                exclude_features = st.text_area(
+                    "Exclude Features (one per line)",
+                    value="",
+                    height=100,
+                    help="Features to exclude from selection (e.g., ID columns)"
+                )
+            
+            with prefilter_col2:
+                include_features = st.text_area(
+                    "Include Features (one per line)",
+                    value="",
+                    height=100,
+                    help="Features to always include regardless of importance"
+                )
+        
+        # Run Feature Selection tab
+        with feature_tabs[2]:
+            st.subheader("Run Feature Selection")
+            
+            # Summary of settings
+            st.write("### Summary of Feature Selection Settings")
+            
+            # Create a summary DataFrame
+            settings_summary = pd.DataFrame([
+                {"Setting": "Selection Method", "Value": selection_method},
+                {"Setting": "Test Size", "Value": test_size},
+                {"Setting": "Correlation Threshold", "Value": correlation_threshold}
+            ])
+            
+            if selection_method == "null_importance":
+                settings_summary = pd.concat([
+                    settings_summary,
+                    pd.DataFrame([
+                        {"Setting": "Number of Null Runs", "Value": n_runs},
+                        {"Setting": "Threshold Method", "Value": threshold_method},
+                        {"Setting": "Threshold Value", "Value": threshold_value}
+                    ])
+                ])
+            else:
+                settings_summary = pd.concat([
+                    settings_summary,
+                    pd.DataFrame([
+                        {"Setting": "Importance Threshold", "Value": importance_threshold}
+                    ])
+                ])
+            
+            st.table(settings_summary)
+            
+            # Process exclude and include features
+            exclude_list = [f.strip() for f in exclude_features.strip().split("\n") if f.strip()]
+            include_list = [f.strip() for f in include_features.strip().split("\n") if f.strip()]
+            
+            st.write(f"Excluding {len(exclude_list)} features and always including {len(include_list)} features")
+            
+            # Button to run feature selection
+            description = st.text_input(
+                "Description for this feature selection run",
+                value=f"Feature selection with {selection_method} method",
+                help="A brief description to identify these results later"
             )
-        
-        with col3:
-            percent_kept = 100 - results.get('reduction_percentage', 0.0)
-            st.metric(
-                "Features Kept", 
-                f"{percent_kept:.1f}%",
-                help="Percentage of original features kept"
+            
+            start_button = st.button(
+                "Start Feature Selection",
+                help="This may take some time depending on the settings",
+                use_container_width=True
             )
+            
+            if start_button:
+                with st.spinner("Running feature selection..."):
+                    # Prepare parameters for feature selection
+                    params = {
+                        "selection_method": selection_method,
+                        "test_size": test_size,
+                        "correlation_threshold": correlation_threshold,
+                        "random_state": random_seed,
+                        "n_runs": n_runs,
+                        "threshold_method": threshold_method,
+                        "threshold_value": threshold_value,
+                        "exclude_features": exclude_list,
+                        "include_features": include_list
+                    }
+                    
+                    # Add a progress bar for long-running operations
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    
+                    def update_progress(progress, status):
+                        progress_bar.progress(progress)
+                        status_text.text(status)
+                    
+                    # Create a progress bar adapter class that has the expected interface
+                    class ProgressBarAdapter:
+                        def __init__(self, update_fn):
+                            self.update_fn = update_fn
+                        
+                        def progress(self, value, text=None):
+                            self.update_fn(value, text if text else "")
+                    
+                    # Create an adapter instance
+                    progress_adapter = ProgressBarAdapter(update_progress)
+                    
+                    # Set callback function in session state
+                    st.session_state["update_progress"] = update_progress
+                    
+                    # Record start time
+                    start_time = time.time()
+                    
+                    # Run feature selection with update_progress callback
+                    try:
+                        # Extract target and features
+                        if "TARGET" in data.columns:
+                            y = data["TARGET"]
+                            X = data.drop(columns=["TARGET"])
+                        else:
+                            st.error("No TARGET column found in the data")
+                            return
+                            
+                        # Call the perform_feature_selection function with individual parameters
+                        feature_selector = perform_feature_selection(
+                            X=X, 
+                            y=y,
+                            n_runs=params["n_runs"],
+                            correlation_threshold=params["correlation_threshold"],
+                            random_state=params["random_state"],
+                            progress_bar=progress_adapter,
+                            use_gpu=True
+                        )
+                        
+                        # Process the results
+                        selected_features = feature_selector[0].columns.tolist()
+                        
+                        # Create results dictionary
+                        feature_selection_results = {
+                            "selected_features": selected_features,
+                            "feature_scores": feature_selector[2].get("feature_scores"),
+                            "params": params,
+                            "feature_score_plots": create_feature_score_plots(feature_selector[2].get("feature_scores")),
+                            # Add the split data to feature_selection_results for model_training_tab.py
+                            "X_train": feature_selector[0],  # Selected features DataFrame
+                            "y_train": y,
+                            "X_test": pd.DataFrame(X[feature_selector[0].columns], index=X.index),
+                            "y_test": y
+                        }
+                        
+                        # Record end time and calculate duration
+                        end_time = time.time()
+                        duration = end_time - start_time
+                        
+                        # Save feature selection results
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        feature_selection_results["timestamp"] = timestamp
+                        feature_selection_results["description"] = description
+                        feature_selection_results["duration"] = duration
+                        
+                        # Save to session state and to file
+                        st.session_state["feature_selection_results"] = feature_selection_results
+                        save_step_data("feature_selection", feature_selection_results, description)
+                        
+                        # Show success message
+                        st.success(f"Feature selection completed in {duration:.1f} seconds!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Error running feature selection: {str(e)}")
+    
+    else:
+        # Display feature selection results
+        display_feature_selection_results(feature_selection_results, data)
         
-        # Show button to view detailed results
-        if st.button("View Detailed Results", key="view_fs_details"):
-            # Create feature score plots
-            plots = create_feature_score_plots(results["feature_scores"])
+        # Add button to clear results and run new selection
+        if st.button("Clear Results and Run New Selection"):
+            del st.session_state["feature_selection_results"]
+            st.rerun()
+
+def display_feature_selection_results(results: Dict[str, Any], original_data: pd.DataFrame):
+    """
+    Display the feature selection results.
+    
+    Parameters
+    ----------
+    results : Dict[str, Any]
+        Feature selection results
+    original_data : pd.DataFrame
+        Original data used for feature selection
+    """
+    # Extract key information from results
+    selected_features = results.get("selected_features", [])
+    feature_scores = results.get("feature_scores")
+    method = results.get("params", {}).get("selection_method", "unknown")
+    description = results.get("description", "Feature selection results")
+    timestamp = results.get("timestamp", "unknown")
+    duration = results.get("duration", 0)
+    
+    # Create a dashboard layout
+    st.write(f"### {description}")
+    st.write(f"Run on: {timestamp.replace('_', ' ')} (took {duration:.1f} seconds)")
+    
+    # Display metrics
+    metrics_col1, metrics_col2, metrics_col3 = st.columns(3)
+    
+    with metrics_col1:
+        st.metric("Selected Features", len(selected_features))
+    
+    with metrics_col2:
+        st.metric("Feature Reduction", f"{(1 - len(selected_features) / len(original_data.columns)) * 100:.1f}%")
+    
+    with metrics_col3:
+        if method == "null_importance":
+            n_runs = results.get("params", {}).get("n_runs", 0)
+            st.metric("Null Importance Runs", n_runs)
+    
+    # Create tabs for different views of the results
+    results_tabs = st.tabs(["Feature Scores", "Selected Features", "Feature Distributions"])
+    
+    # Feature Scores tab
+    with results_tabs[0]:
+        st.subheader("Feature Importance Scores")
+        
+        if method == "null_importance" and "feature_score_plots" in results:
+            # Display the feature score plots created during feature selection
+            for fig_title, fig in results["feature_score_plots"].items():
+                st.write(f"#### {fig_title}")
+                try:
+                    # Check if this is a Plotly figure
+                    if hasattr(fig, 'update_layout'):
+                        st.plotly_chart(fig, use_container_width=True)
+                    else:
+                        # Assume it's a matplotlib figure if not a Plotly figure
+                        st.pyplot(fig)
+                except Exception as e:
+                    st.error(f"Error displaying plot: {str(e)}")
+                    st.write("Plot data available but could not be displayed.")
+        
+        # Show feature scores table
+        if feature_scores is not None:
+            # Prepare table of feature scores
+            if isinstance(feature_scores, pd.DataFrame):
+                score_df = feature_scores
+            else:
+                # Convert to DataFrame if it's a dict or other format
+                score_df = pd.DataFrame({
+                    "Feature": list(feature_scores.keys()),
+                    "Score": list(feature_scores.values())
+                }).sort_values("Score", ascending=False)
             
-            # Display plots in tabs
-            plot_tabs = st.tabs(["Top Features", "Bottom Features", "Score Distributions"])
+            st.write("#### Feature Scores Table")
+            st.dataframe(
+                prepare_dataframe_for_streamlit(score_df),
+                use_container_width=True
+            )
+    
+    # Selected Features tab
+    with results_tabs[1]:
+        st.subheader("Selected Features")
+        
+        # Group features by type or source
+        if any("(" in f for f in selected_features):
+            # Features likely have source information in them
+            feature_types = {}
+            for feature in selected_features:
+                if "(" in feature:
+                    feature_type = feature.split("(")[1].split(")")[0].split(".")[0]
+                    if feature_type not in feature_types:
+                        feature_types[feature_type] = []
+                    feature_types[feature_type].append(feature)
+                else:
+                    if "Other" not in feature_types:
+                        feature_types["Other"] = []
+                    feature_types["Other"].append(feature)
             
-            with plot_tabs[0]:
-                st.subheader("Top Features by Score")
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    st.plotly_chart(plots["top_split"], use_container_width=True)
-                
-                with col2:
-                    st.plotly_chart(plots["top_gain"], use_container_width=True)
+            # Display features by type
+            for feature_type, features in sorted(feature_types.items()):
+                with st.expander(f"{feature_type} ({len(features)} features)", expanded=False):
+                    st.write(", ".join(sorted(features)))
+        else:
+            # Just show the list of selected features
+            st.write(", ".join(sorted(selected_features)))
+        
+        # Download button for selected features
+        features_csv = "\n".join(selected_features)
+        st.download_button(
+            "Download Selected Features",
+            features_csv,
+            file_name=f"selected_features_{timestamp}.csv",
+            mime="text/csv"
+        )
+    
+    # Feature Distributions tab
+    with results_tabs[2]:
+        st.subheader("Feature Distributions")
+        
+        # Allow user to select features to visualize
+        selected_viz_features = st.multiselect(
+            "Select features to visualize",
+            options=selected_features,
+            default=selected_features[:min(5, len(selected_features))],
+            help="Select features to view their distributions"
+        )
+        
+        if selected_viz_features:
+            # Check if we have target column for stratification
+            has_target = "TARGET" in original_data.columns
             
-            with plot_tabs[1]:
-                st.subheader("Bottom Features by Score")
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    st.plotly_chart(plots["bottom_split"], use_container_width=True)
-                
-                with col2:
-                    st.plotly_chart(plots["bottom_gain"], use_container_width=True)
-            
-            with plot_tabs[2]:
-                st.subheader("Score Distributions")
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    st.plotly_chart(plots["split_distribution"], use_container_width=True)
-                
-                with col2:
-                    st.plotly_chart(plots["gain_distribution"], use_container_width=True)
-            
-            # Show list of selected features
-            with st.expander("Selected Features"):
-                st.dataframe(pd.DataFrame({"feature": results["feature_selector"].get_useful_features()})) 
+            for feature in selected_viz_features:
+                if feature in original_data.columns:
+                    st.write(f"#### {feature}")
+                    
+                    try:
+                        # Create a distribution plot
+                        if has_target:
+                            fig = px.histogram(
+                                original_data, 
+                                x=feature,
+                                color="TARGET",
+                                barmode="overlay",
+                                opacity=0.7,
+                                marginal="box"
+                            )
+                        else:
+                            fig = px.histogram(
+                                original_data, 
+                                x=feature,
+                                opacity=0.7,
+                                marginal="box"
+                            )
+                        
+                        # Update layout
+                        fig.update_layout(
+                            height=400,
+                            width=700
+                        )
+                        
+                        st.plotly_chart(fig, use_container_width=True)
+                    except Exception as e:
+                        st.error(f"Could not plot {feature}: {str(e)}")
+                else:
+                    st.warning(f"Feature {feature} not found in the original data") 
