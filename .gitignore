@@ -151,3 +151,8 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 data
+/pipeline1
+/pipeline1
+/pipeline2
+pipeline2/fix_mistake.py
+/pipeline2

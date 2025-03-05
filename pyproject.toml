@@ -1,0 +1,116 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "credit-risk"
+version = "0.1.0"
+description = "Credit default risk prediction with automated feature engineering"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "Your Name", email = "your.email@example.com"}
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "numpy>=1.20.0",
+    "pandas>=1.3.0",
+    "featuretools>=1.9.0",
+    "scikit-learn>=1.0.0",
+    "matplotlib>=3.4.0",
+    "seaborn>=0.11.0",
+    "pyarrow>=8.0.0",  # For parquet support
+    "mlflow>=2.0.0",   # For experiment tracking
+    "psutil>=5.9.0",   # For system metrics
+    "flask>=2.2.0",    # For web interface
+    "pyyaml>=6.0",     # For configuration files
+]
+
+[project.optional-dependencies]
+dev = [
+    "black",
+    "flake8",
+    "isort",
+    "mypy",
+    "pytest",
+    "pytest-cov",
+]
+docs = [
+    "mkdocs",
+    "mkdocs-material",
+    "mkdocstrings[python]",
+]
+gpu = [
+    "polars>=0.19.0",   # Fast DataFrame library with optional GPU support
+    # RAPIDS components (must be installed separately with conda)
+    # "cudf>=23.04.00",  # GPU-accelerated DataFrame
+    # "cupy>=12.0.0",    # GPU-accelerated NumPy-like array library
+    # "cuml>=23.04.00",  # GPU-accelerated machine learning
+]
+web = [
+    "streamlit>=1.26.0",  # For interactive web apps
+    "plotly>=5.15.0",     # For interactive visualizations
+    "pydeck>=0.8.0",      # For geospatial visualizations
+]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/credit-risk"
+Issues = "https://github.com/yourusername/credit-risk/issues"
+
+[project.scripts]
+credit-risk-features = "credit_risk.run_feature_engineering:main"
+credit-risk-app = "credit_risk.web.app:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.black]
+line-length = 88
+target-version = ["py38", "py39", "py310", "py311"]
+include = '\.pyi?$'
+
+[tool.isort]
+profile = "black"
+line_length = 88
+skip_gitignore = true
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+
+[[tool.mypy.overrides]]
+module = [
+    "featuretools.*",
+    "pandas.*",
+    "numpy.*",
+    "matplotlib.*",
+    "seaborn.*",
+    "mlflow.*",
+    "polars.*",
+    "streamlit.*",
+    "plotly.*",
+    "pydeck.*",
+]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_functions = "test_*"
+addopts = "--cov=credit_risk --cov-report=term-missing" 
