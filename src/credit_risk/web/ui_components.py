@@ -9,13 +9,15 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 from typing import Dict, Any, List, Optional, Callable, Union, Tuple
-import logging
 import time
 from datetime import datetime
+import matplotlib.pyplot as plt
+import seaborn as sns
+from credit_risk.utils.logging_utils import get_logger
+from credit_risk.utils.streamlit_utils import prepare_dataframe_for_streamlit
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # Styling constants
 PRIMARY_COLOR = "#0068c9"
@@ -99,6 +101,10 @@ def display_dataframe_with_metrics(df: pd.DataFrame, name: str = "DataFrame"):
     name : str
         Name of the DataFrame
     """
+    if df is None:
+        st.warning(f"No {name} data available to display.")
+        return
+        
     # Create metrics
     col1, col2, col3 = st.columns(3)
     
@@ -109,11 +115,14 @@ def display_dataframe_with_metrics(df: pd.DataFrame, name: str = "DataFrame"):
         st.metric("Columns", df.shape[1])
     
     with col3:
-        missing_percent = (df.isnull().sum().sum() / (df.shape[0] * df.shape[1])) * 100
-        st.metric("Missing Values", f"{missing_percent:.2f}%")
+        numeric_cols = df.select_dtypes(include=np.number).columns
+        st.metric("Numeric Features", len(numeric_cols))
     
-    # Display DataFrame sample
-    st.dataframe(df.head(10))
+    # Prepare dataframe for display to avoid Arrow serialization issues
+    display_df = prepare_dataframe_for_streamlit(df)
+    
+    # Display dataframe
+    st.dataframe(display_df)
     
     # Add download option
     if st.button(f"Download {name} as CSV"):
@@ -344,6 +353,7 @@ def model_parameter_section(model_type: str):
             max_value=1000,
             value=100,
             step=50,
+            key=f"{model_type}_n_estimators",
             help=parameter_help(
                 "Number of trees in the ensemble",
                 "Controls model complexity and training time. More trees generally improve performance but increase training time.",
@@ -359,6 +369,7 @@ def model_parameter_section(model_type: str):
             max_value=0.3,
             value=0.1,
             step=0.01,
+            key=f"{model_type}_learning_rate",
             help=parameter_help(
                 "Step size shrinkage",
                 "Controls how quickly the model learns. Lower values require more trees but can lead to better generalization.",
@@ -379,6 +390,7 @@ def model_parameter_section(model_type: str):
                 max_value=10,
                 value=6,
                 step=1,
+                key="xgboost_max_depth",
                 help=parameter_help(
                     "Maximum depth of trees",
                     "Controls complexity of individual trees. Deeper trees can model more complex patterns but may overfit.",
@@ -394,6 +406,7 @@ def model_parameter_section(model_type: str):
                 max_value=5.0,
                 value=0.0,
                 step=0.1,
+                key="xgboost_gamma",
                 help=parameter_help(
                     "Minimum loss reduction for split",
                     "Controls complexity via regularization. Higher values create more conservative trees.",
@@ -410,6 +423,7 @@ def model_parameter_section(model_type: str):
                 max_value=1.0,
                 value=1.0,
                 step=0.1,
+                key="xgboost_subsample",
                 help=parameter_help(
                     "Fraction of samples used per tree",
                     "Controls overfitting by using random subsets of data. Values below 1.0 make trees more independent.",
@@ -424,6 +438,7 @@ def model_parameter_section(model_type: str):
                 max_value=1.0,
                 value=1.0,
                 step=0.1,
+                key="xgboost_colsample_bytree",
                 help=parameter_help(
                     "Fraction of features used per tree",
                     "Like feature bagging in random forests. Lower values create more diverse trees.",
@@ -442,6 +457,7 @@ def model_parameter_section(model_type: str):
                 max_value=256,
                 value=31,
                 step=8,
+                key="lightgbm_num_leaves",
                 help=parameter_help(
                     "Maximum number of leaves in tree",
                     "LightGBM grows trees leaf-wise rather than depth-wise. This controls tree complexity.",
@@ -457,6 +473,7 @@ def model_parameter_section(model_type: str):
                 max_value=15,
                 value=-1,
                 step=1,
+                key="lightgbm_max_depth",
                 help=parameter_help(
                     "Maximum tree depth",
                     "Limits the max depth of the tree. -1 means no limit.",
@@ -472,6 +489,7 @@ def model_parameter_section(model_type: str):
                 max_value=100,
                 value=20,
                 step=5,
+                key="lightgbm_min_child_samples",
                 help=parameter_help(
                     "Minimum samples per leaf",
                     "Prevents creating leaves with too few samples. Helps control overfitting.",
@@ -486,6 +504,7 @@ def model_parameter_section(model_type: str):
                 max_value=1.0,
                 value=0.8,
                 step=0.1,
+                key="lightgbm_feature_fraction",
                 help=parameter_help(
                     "Fraction of features to use",
                     "Similar to colsample_bytree in XGBoost. Lower values create more diverse trees.",
@@ -504,6 +523,7 @@ def model_parameter_section(model_type: str):
                 max_value=10,
                 value=6,
                 step=1,
+                key="catboost_depth",
                 help=parameter_help(
                     "Depth of the tree",
                     "Controls complexity of individual trees. Deeper trees can model more complex patterns.",
@@ -519,6 +539,7 @@ def model_parameter_section(model_type: str):
                 max_value=10.0,
                 value=3.0,
                 step=1.0,
+                key="catboost_l2_leaf_reg",
                 help=parameter_help(
                     "L2 regularization coefficient",
                     "Controls model complexity via regularization. Higher values create a more conservative model.",
@@ -534,6 +555,7 @@ def model_parameter_section(model_type: str):
                 max_value=1.0,
                 value=1.0,
                 step=0.1,
+                key="catboost_rsm",
                 help=parameter_help(
                     "Random strength for feature selection",
                     "Similar to colsample in other models. Controls randomness in feature selection.",
@@ -548,6 +570,7 @@ def model_parameter_section(model_type: str):
                 max_value=255,
                 value=128,
                 step=32,
+                key="catboost_border_count",
                 help=parameter_help(
                     "Number of splits for numerical features",
                     "Controls granularity of numerical feature splits.",

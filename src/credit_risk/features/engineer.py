@@ -54,228 +54,67 @@ class FeatureEngineer:
         chunk_size: Optional[int] = None,
         n_jobs: int = -1
     ) -> Union[pd.DataFrame, List[str]]:
-        """Generate features using featuretools.
-        
-        Args:
-            datasets: Dictionary mapping dataset names to DataFrames
-            agg_primitives: List of aggregation primitives to use.
-                If None, uses config defaults.
-            max_depth: Maximum depth for feature engineering.
-                If None, uses config default.
-            features_only: If True, return list of feature names instead of DataFrame
-            verbose: Whether to display progress information
-            chunk_size: Size of chunks to use for feature calculation (helps with memory usage)
-            n_jobs: Number of parallel jobs for feature calculation (-1 uses all cores)
-            
-        Returns:
-            If features_only is True, returns a list of feature names.
-            Otherwise, returns a DataFrame with the generated features.
         """
-        # Log information about input datasets
-        total_rows = 0
-        total_cols = 0
-        dataset_info = []
+        Generate features from datasets using Featuretools.
         
-        for name, df in datasets.items():
-            rows, cols = df.shape
-            total_rows += rows
-            total_cols += cols
-            dataset_info.append(f"{name}: {rows} rows, {cols} columns")
-        
-        logger.info(f"Input datasets: {len(datasets)} datasets with {total_rows} total rows and {total_cols} total columns")
-        for info in dataset_info:
-            logger.info(f"  - {info}")
+        Parameters
+        ----------
+        datasets : Dict[str, pd.DataFrame]
+            Dictionary of datasets, with keys as dataset names
+        agg_primitives : Optional[List[str]], optional
+            List of aggregation primitives to use, by default None
+        max_depth : Optional[int], optional
+            Maximum depth for feature stacking, by default None
+        features_only : bool, optional
+            Whether to return only feature names without calculating values, by default False
+        verbose : bool, optional
+            Whether to print progress, by default True
+        chunk_size : Optional[int], optional
+            Chunk size for parallel processing, by default None
+        n_jobs : int, optional
+            Number of parallel jobs, by default -1
             
-        # Get default parameters from config if not provided
-        if agg_primitives is None:
+        Returns
+        -------
+        Union[pd.DataFrame, List[str]]
+            DataFrame with calculated features, or list of feature names if features_only=True
+            
+        Raises
+        ------
+        ValueError
+            If no datasets are provided
+        """
+        if not datasets:
+            raise ValueError("No datasets provided for feature engineering")
+            
+        # Use config values if parameters are not provided
+        if agg_primitives is None and self.config:
             agg_primitives = self.config.features.default_agg_primitives
             
-        if max_depth is None:
+        if max_depth is None and self.config:
             max_depth = self.config.features.max_depth
             
-        # Consider using a reduced set of aggregation primitives for better performance
-        # For example, prioritize sum, mean and count which are often most informative
-        # while skipping more computationally expensive operations like std
-        if len(agg_primitives) > 3 and self.config.is_development_mode:
-            logger.info("Using reduced set of aggregation primitives for development mode")
-            agg_primitives = agg_primitives[:3]  # Use only the first three primitives in dev mode
+        # Force n_jobs to 1 to avoid distributed errors
+        # Override any passed n_jobs value
+        n_jobs = 1
         
-        # Fix date formats for woodwork to avoid warnings
-        # Identify and preprocess date-related columns to prevent Woodwork parsing warnings
-        reference_date = pd.Timestamp('2018-01-01')  # Use a reference date as a base
+        # Default values if still None
+        agg_primitives = agg_primitives or ["mean", "min", "max", "count", "sum", "std"]
+        max_depth = max_depth or 2
         
-        for name, df in datasets.items():
-            if isinstance(df, pd.DataFrame):
-                date_columns = []
-                
-                # First pass: identify date-like columns
-                for col in df.columns:
-                    # Keep track of columns we've modified to avoid double processing
-                    column_modified = False
-                    
-                    # Check if column looks like it contains date values
-                    if any(date_term in col.upper() for date_term in ['DATE', 'DAY', 'DAYS', 'MONTH', 'MONTHS', 'YEAR']):
-                        # For numeric days/months values (common in this dataset), convert to numeric but don't parse as dates
-                        if pd.api.types.is_numeric_dtype(df[col].dtype):
-                            try:
-                                # Replace extreme values (often used as missing indicators)
-                                if df[col].max() > 10000:
-                                    outlier_value = 365243  # Common outlier value in this dataset
-                                    df[col] = df[col].replace(outlier_value, np.nan)
-                                
-                                # Just ensure it's numeric without datetime conversion
-                                df[col] = pd.to_numeric(df[col], errors='coerce')
-                                logger.debug(f"Preprocessed numeric date-related column {col} in {name}")
-                                column_modified = True
-                            except Exception as e:
-                                logger.warning(f"Could not preprocess date-related column {col} in {name}: {str(e)}")
-                        
-                        # For actual date columns that need parsing
-                        elif pd.api.types.is_object_dtype(df[col].dtype) and not column_modified:
-                            # Try to identify if this is an actual date column that needs conversion
-                            sample_values = df[col].dropna().head(10).astype(str)
-                            if sample_values.empty:
-                                continue
-                            
-                            # Check if values look like dates by trying a few common formats
-                            common_formats = ['%Y-%m-%d', '%d-%m-%Y', '%m/%d/%Y', '%d/%m/%Y', '%Y/%m/%d']
-                            for date_format in common_formats:
-                                try:
-                                    # If this works for at least some values, it's probably a date
-                                    pd.to_datetime(sample_values.iloc[0], format=date_format)
-                                    # Convert with explicit format
-                                    df[col] = pd.to_datetime(df[col], format=date_format, errors='coerce')
-                                    logger.debug(f"Converted date column {col} in {name} using format {date_format}")
-                                    date_columns.append(col)
-                                    column_modified = True
-                                    break
-                                except (ValueError, TypeError):
-                                    continue
-                
-                # Handle special case DATE columns if they weren't already processed
-                for col in df.columns:
-                    if 'DATE' in col.upper() and col not in date_columns and not pd.api.types.is_numeric_dtype(df[col].dtype):
-                        try:
-                            # Try one more time with a flexible parser but with explicit errors='coerce'
-                            df[col] = pd.to_datetime(df[col], errors='coerce')
-                            logger.debug(f"Converted remaining date column {col} in {name}")
-                        except Exception as e:
-                            logger.warning(f"Could not convert date column {col} in {name}: {str(e)}")
+        # Log parameters
+        logger.info(f"Feature engineering - max_depth: {max_depth}, n_jobs: {n_jobs}")
+        logger.info(f"Aggregation primitives: {agg_primitives}")
         
-        # Build entity set
+        # Build entityset if we don't have one
+        if self.entity_builder is None:
+            self.entity_builder = EntitySetBuilder()
+            
         entity_set = self.entity_builder.build_entity_set(datasets)
         
-        # Calculate optimal number of workers and chunk size based on dataset size
-        total_memory_gb = self._get_available_memory_gb()
-        logger.info(f"Available system memory: {total_memory_gb:.2f} GB")
-        
-        # Calculate memory per row (approximately)
-        app_df = datasets.get('app', datasets.get('application_train', None))
-        if app_df is not None:
-            rows = app_df.shape[0]
-            # Calculate memory more accurately with deep=True
-            mem_per_row_kb = app_df.memory_usage(deep=True).sum() / rows / 1024
-            
-            # Estimate memory based on dataset size and complexity
-            # The expansion factor depends on the depth and aggregation primitives
-            # For complex operations, we need a higher memory estimation
-            expansion_factor = 3  # Default for simple operations
-            
-            # Adjust expansion factor based on max_depth
-            if max_depth is not None:
-                expansion_factor = max(3, 2 * max_depth)
-            
-            # Adjust expansion factor based on number of primitives
-            if agg_primitives and len(agg_primitives) > 5:
-                expansion_factor = max(expansion_factor, len(agg_primitives))
-            
-            # Add additional factor for each related table (joins increase memory usage)
-            related_tables_factor = 1 + (0.5 * (len(datasets) - 1)) if len(datasets) > 1 else 1
-            
-            # Final memory estimation
-            estimated_memory_mb = (mem_per_row_kb * rows * expansion_factor * related_tables_factor) / 1024
-            logger.info(f"Estimated memory needed per worker: {estimated_memory_mb:.2f} MB with expansion factor: {expansion_factor:.1f}x")
-            
-            # Calculate optimal workers based on memory constraints
-            if n_jobs == -1 or n_jobs > 1:
-                # Reserve more memory for system and other processes (at least 4GB)
-                system_reserve_gb = min(4, total_memory_gb * 0.2)
-                usable_memory_gb = max(1, total_memory_gb - system_reserve_gb)
-                
-                # Be more conservative with memory allocation - aim to use at most 60% of usable memory
-                # This helps prevent OOM errors
-                target_memory_gb = usable_memory_gb * 0.6
-                
-                # Estimate memory needed for feature generation
-                worker_memory_gb = estimated_memory_mb / 1024
-                
-                if worker_memory_gb > 0:
-                    # Calculate optimal number of workers
-                    optimal_workers = int(target_memory_gb / worker_memory_gb)
-                    
-                    # For very large datasets, be even more conservative
-                    if total_rows > 10000000:  # If more than 10M rows total
-                        optimal_workers = max(1, optimal_workers - 1)
-                        logger.info("Reducing worker count by 1 due to large dataset size")
-                    
-                    # Ensure at least 1 worker, at most system CPU count
-                    import multiprocessing
-                    cpu_count = multiprocessing.cpu_count()
-                    optimal_workers = max(1, min(cpu_count - 1, optimal_workers))
-                    
-                    # If optimal is very low, that's a sign we might need smaller chunks
-                    if optimal_workers <= 2 and chunk_size is None:
-                        # Use a smaller chunk size for memory constrained environments
-                        chunk_size = min(5000, rows // 10) if rows > 5000 else rows
-                        logger.info(f"Memory constrained environment detected, setting smaller chunk size: {chunk_size}")
-                    
-                    if n_jobs == -1 or n_jobs > optimal_workers:
-                        logger.info(f"Adjusting number of workers from {n_jobs} to {optimal_workers} based on memory constraints")
-                        n_jobs = optimal_workers
-                    
-                    # For very large feature engineering tasks, lower the parallelism further
-                    if max_depth is not None and max_depth >= 2 and len(datasets) >= 4:
-                        safe_workers = max(1, n_jobs // 2)
-                        logger.info(f"Complex feature engineering task detected. Further reducing workers from {n_jobs} to {safe_workers}")
-                        n_jobs = safe_workers
-        
-        # Set a reasonable chunk size if not specified
-        if chunk_size is None:
-            if app_df is not None:
-                rows = app_df.shape[0]
-                # For small datasets, process all at once
-                if rows <= 5000:
-                    chunk_size = rows
-                # For medium datasets, use approximately 20% of rows
-                elif rows <= 50000:
-                    chunk_size = max(1000, min(rows // 5, 10000))
-                # For large datasets, use a smaller percentage
-                else:
-                    chunk_size = max(1000, min(rows // 10, 5000))
-                logger.info(f"Setting automatic chunk size to {chunk_size}")
-        
-        if chunk_size is not None:
-            logger.info(f"Using chunking with chunk_size={chunk_size}")
-            # Handle both DataFrame and EntitySet dataframe formats
-            # Sometimes 'app' is a DataFrame and sometimes it's an EntityDataFrame with df attribute
-            try:
-                if hasattr(entity_set['app'], 'df'):
-                    chunk_size = min(chunk_size, entity_set['app'].df.shape[0])
-                else:
-                    # If entity_set['app'] is just a DataFrame itself
-                    chunk_size = min(chunk_size, entity_set['app'].shape[0])
-            except (AttributeError, KeyError) as e:
-                logger.warning(f"Could not get entity shape for chunk sizing: {str(e)}")
-                # Fall back to using app_df from datasets
-                if app_df is not None:
-                    chunk_size = min(chunk_size, app_df.shape[0])
-        
-        logger.info(f"Generating features with max_depth={max_depth}, n_jobs={n_jobs}")
-        logger.info(f"Using aggregation primitives: {agg_primitives}")
-        
-        # Generate features using featuretools with performance optimizations
+        # Try to generate features
         try:
-            # Define a proper progress callback that can handle multiple arguments
+            # Define progress callback
             def progress_callback(*args):
                 if verbose:
                     if len(args) == 1:
@@ -283,6 +122,10 @@ class FeatureEngineer:
                     else:
                         logger.info(f"Progress update: {args}")
                 
+            # Disable Dask/distributed to avoid errors
+            import os
+            os.environ["FEATURETOOLS_NO_DASK"] = "1"
+            
             features = ft.dfs(
                 entityset=entity_set,
                 target_dataframe_name="app",
@@ -290,51 +133,45 @@ class FeatureEngineer:
                 max_depth=max_depth,
                 features_only=features_only,
                 verbose=verbose,
-                chunk_size=chunk_size,
-                n_jobs=n_jobs,
-                # Use a proper progress callback that can handle multiple arguments
+                chunk_size=chunk_size,  # Not used when n_jobs=1
+                n_jobs=1,  # Force single process to avoid distributed errors
                 progress_callback=progress_callback
             )
             
             # Log feature generation results
             if not features_only:
-                # If we have a DataFrame, log its shape and some stats
-                if isinstance(features, pd.DataFrame):
-                    rows, cols = features.shape
-                    original_cols = len(datasets.get("app", datasets.get("application_train", pd.DataFrame())).columns)
-                    new_cols = cols - original_cols  # Approximate number of new columns
-                    
-                    logger.info(f"Feature generation complete: {rows} rows, {cols} total columns")
-                    logger.info(f"Original features: {original_cols}, New features generated: {new_cols}")
-                    
-                    # Additional stats about the feature matrix
-                    numeric_cols = len(features.select_dtypes(include=['number']).columns)
-                    logger.info(f"Numeric features: {numeric_cols}")
-        
-        except MemoryError as me:
-            logger.error(f"Memory error during feature generation: {str(me)}")
-            # Reduce workers to 1 and chunk size further for memory-constrained environments
-            if n_jobs > 1:
-                n_jobs = 1
-                chunk_size = min(chunk_size, 5000) if chunk_size else 5000
-                logger.info(f"Retrying with reduced resources: n_jobs={n_jobs}, chunk_size={chunk_size}")
-                return self.generate_features(
-                    datasets=datasets,
-                    agg_primitives=agg_primitives,
-                    max_depth=max_depth,
-                    features_only=features_only,
-                    verbose=verbose,
-                    chunk_size=chunk_size,
-                    n_jobs=n_jobs
-                )
+                # Get the features DataFrame if a tuple was returned
+                if isinstance(features, tuple):
+                    features_df = features[0]
+                    feature_defs = features[1]
+                    logger.info(f"Feature engineering complete. Generated DataFrame with shape: {features_df.shape}")
+                else:
+                    features_df = features
+                    logger.info(f"Feature engineering complete. Generated DataFrame with shape: {features_df.shape}")
+                
+                return features_df
             else:
-                # If already at minimum resources, raise the error
-                raise
+                logger.info(f"Feature engineering complete. Generated {len(features)} feature definitions")
+                self._save_feature_names([f.get_name() for f in features])
+                return features
+                
         except Exception as e:
-            logger.error(f"Error during feature generation: {str(e)}")
-            raise
-        
-        return features
+            logger.error(f"Error during feature generation: {str(e)}", exc_info=True)
+            # Try to create a simple set of features as a fallback
+            logger.info("Attempting to use simplified feature generation as a fallback")
+            try:
+                # Get application dataframe
+                app_df = datasets.get("application_train", None)
+                if app_df is not None:
+                    # Just do basic feature engineering on the app dataframe
+                    result_df = self.create_manual_features(app_df)
+                    logger.info(f"Successfully created basic features: {result_df.shape}")
+                    return result_df
+                else:
+                    raise ValueError("No application_train dataset found")
+            except Exception as fallback_error:
+                logger.error(f"Fallback feature generation also failed: {str(fallback_error)}", exc_info=True)
+                raise
     
     def _save_feature_names(self, feature_names: List[str]) -> None:
         """Save feature names to a file.

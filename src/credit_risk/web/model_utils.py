@@ -18,9 +18,20 @@ import streamlit as st
 from sklearn.model_selection import train_test_split
 import plotly.express as px
 import plotly.graph_objects as go
-from typing import Dict, List, Tuple, Union, Optional, Any
+from typing import Dict, List, Tuple, Union, Optional, Any, Callable
 import sys
 import importlib
+import json
+import mlflow
+import mlflow.sklearn
+import mlflow.lightgbm
+import mlflow.xgboost
+from mlflow.tracking import MlflowClient
+from sklearn.metrics import (
+    roc_curve, roc_auc_score, accuracy_score, 
+    precision_score, recall_score, f1_score,
+    confusion_matrix
+)
 
 # Attempt to import FeatureSelector with fallback
 try:
@@ -392,118 +403,304 @@ def create_feature_score_plots(feature_scores: pd.DataFrame) -> Dict[str, plt.Fi
     
     return plots
 
+def log_model_to_mlflow(
+    model, 
+    model_type: str, 
+    params: Dict[str, Any], 
+    metrics: Dict[str, float],
+    training_params: Dict[str, Any],
+    feature_names: List[str],
+    data_source: str,
+    tags: Dict[str, str] = None
+) -> str:
+    """
+    Log a model and its associated metadata to MLflow.
+    
+    Parameters
+    ----------
+    model : Any
+        The trained model object
+    model_type : str
+        Type of model (lightgbm, xgboost, catboost)
+    params : Dict[str, Any]
+        Model parameters
+    metrics : Dict[str, float]
+        Model performance metrics
+    training_params : Dict[str, Any]
+        Training parameters
+    feature_names : List[str]
+        Names of features used in the model
+    data_source : str
+        Source of the data (feature_selection, feature_engineering)
+    tags : Dict[str, str], optional
+        Additional tags to log with the run
+        
+    Returns
+    -------
+    str
+        MLflow run ID
+    """
+    # Setup MLflow - ensures the mlruns directory is created in the current directory
+    if not os.path.exists("mlruns"):
+        os.makedirs("mlruns", exist_ok=True)
+    
+    # Get experiment ID or create if it doesn't exist
+    experiment_name = f"credit_risk_{model_type}"
+    
+    try:
+        experiment = mlflow.get_experiment_by_name(experiment_name)
+        if experiment:
+            experiment_id = experiment.experiment_id
+        else:
+            experiment_id = mlflow.create_experiment(experiment_name)
+    except Exception as e:
+        logger.warning(f"Error getting/creating MLflow experiment: {str(e)}")
+        experiment_id = mlflow.create_experiment(experiment_name)
+    
+    # Start MLflow run
+    with mlflow.start_run(experiment_id=experiment_id) as run:
+        run_id = run.info.run_id
+        
+        # Log model parameters
+        for key, value in params.items():
+            mlflow.log_param(key, value)
+        
+        # Log training parameters with prefix
+        for key, value in training_params.items():
+            # Convert non-serializable types to strings
+            if not isinstance(value, (str, int, float, bool)):
+                value = str(value)
+            mlflow.log_param(f"train_{key}", value)
+        
+        # Log metrics
+        for key, value in metrics.items():
+            # Skip complex metrics (like confusion matrix or ROC curve data)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                mlflow.log_metric(key, value)
+        
+        # Log key data characteristics
+        mlflow.log_param("data_source", data_source)
+        mlflow.log_param("n_features", len(feature_names))
+        
+        # Log feature names as a separate file
+        features_file = "feature_names.json"
+        with open(features_file, "w") as f:
+            json.dump(feature_names, f)
+        mlflow.log_artifact(features_file)
+        os.remove(features_file)  # Clean up
+        
+        # Log tags
+        run_tags = {
+            "model_type": model_type,
+            "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S"),
+            "data_source": data_source
+        }
+        
+        # Add custom tags if provided
+        if tags:
+            run_tags.update(tags)
+        
+        # Set tags
+        for key, value in run_tags.items():
+            mlflow.set_tag(key, value)
+        
+        # Log model
+        if model_type == "lightgbm":
+            mlflow.lightgbm.log_model(model, "model")
+        elif model_type == "xgboost":
+            mlflow.xgboost.log_model(model, "model")
+        elif model_type == "catboost":
+            # CatBoost uses sklearn flavor
+            mlflow.sklearn.log_model(model, "model")
+        else:
+            mlflow.sklearn.log_model(model, "model")
+        
+        logger.info(f"Model logged to MLflow with run ID: {run_id}")
+        return run_id
+
 def train_and_evaluate_model(
     X_train: pd.DataFrame,
     y_train: pd.Series,
     X_test: pd.DataFrame,
     y_test: pd.Series,
     model_type: str = "lightgbm",
-    cv_folds: int = 5,
-    model_params: Optional[Dict[str, Any]] = None,
-    random_state: int = 42,
-    progress_bar=None
-) -> Tuple[CreditRiskModel, Dict[str, float], Dict[str, Any], List[plt.Figure]]:
+    params: Dict[str, Any] = None,
+    use_gpu: bool = False
+) -> Tuple[Any, Dict[str, Any]]:
     """
-    Train and evaluate a model.
+    Train and evaluate a model with the given parameters.
     
     Parameters
     ----------
     X_train : pd.DataFrame
-        Training feature matrix
+        Training features
     y_train : pd.Series
-        Training target variable
+        Training target
     X_test : pd.DataFrame
-        Testing feature matrix
+        Testing features
     y_test : pd.Series
-        Testing target variable
+        Testing target
     model_type : str, optional
         Type of model to train, by default "lightgbm"
-    cv_folds : int, optional
-        Number of folds for cross-validation, by default 5
-    model_params : Optional[Dict[str, Any]], optional
+    params : Dict[str, Any], optional
         Model parameters, by default None
-    random_state : int, optional
-        Random seed for reproducibility, by default 42
-    progress_bar : streamlit.ProgressBar, optional
-        Streamlit progress bar to update
+    use_gpu : bool, optional
+        Whether to use GPU for training, by default False
         
     Returns
     -------
-    Tuple[CreditRiskModel, Dict[str, float], Dict[str, Any], List[plt.Figure]]
-        Trained model, evaluation metrics dictionary, CV results dictionary, and list of figures
+    Tuple[Any, Dict[str, Any]]
+        Trained model and evaluation metrics
     """
-    try:
-        # Initialize model
-        model = CreditRiskModel(
-            model_type=model_type,
-            model_params=model_params,
-            random_state=random_state
-        )
-        
-        # Update progress
-        if progress_bar:
-            progress_bar.progress(0.1, "Starting cross-validation...")
-        
-        # Cross-validate
-        cv_results = model.cross_validate(
-            X_train, y_train, n_folds=cv_folds, stratified=True
-        )
-        
-        # Update progress
-        if progress_bar:
-            progress_bar.progress(0.5, "Training final model...")
-        
-        # Train final model
-        model.fit(X_train, y_train)
-        
-        # Update progress
-        if progress_bar:
-            progress_bar.progress(0.8, "Evaluating on test set...")
-        
-        # Evaluate on test set
-        test_results = model.evaluate(X_test, y_test)
-        
-        # Update progress
-        if progress_bar:
-            progress_bar.progress(1.0, "Model training completed!")
-        
-        # Create evaluation figures
-        figures = []
-        
-        # ROC curve figure
-        roc_fig = plt.figure(figsize=(10, 6))
-        model.plot_roc_curve(X_test, y_test, ax=roc_fig.add_subplot(111))
-        figures.append(roc_fig)
-        
-        # Confusion matrix figure
-        cm_fig = plt.figure(figsize=(8, 6))
-        model.plot_confusion_matrix(X_test, y_test, ax=cm_fig.add_subplot(111))
-        figures.append(cm_fig)
-        
-        # Feature importance figure
-        if hasattr(model.model, "feature_importances_"):
-            imp_fig = plt.figure(figsize=(12, 8))
-            ax = imp_fig.add_subplot(111)
-            model.plot_feature_importance(top_n=20, ax=ax)
-            figures.append(imp_fig)
-        
-        # Prepare metrics dictionary
-        metrics = test_results.copy()
-        
-        # Prepare CV results
-        cv_results_formatted = {
-            "mean_auc": cv_results.get("mean_auc", 0.0),
-            "std_auc": cv_results.get("std_auc", 0.0),
-            "auc_scores": cv_results.get("auc_scores", [])
-        }
-        
-        return model, metrics, cv_results_formatted, figures
+    logger.info(f"Training {model_type} model with {X_train.shape[1]} features")
     
-    except Exception as e:
-        logger.error(f"Error in model training: {e}")
-        if progress_bar:
-            progress_bar.progress(1.0, f"Error: {str(e)}")
-        raise
+    # Default parameters for each model type
+    default_params = {
+        "lightgbm": {
+            "objective": "binary",
+            "metric": "auc",
+            "verbosity": -1,
+            "seed": 42,
+            "n_estimators": 100,
+            "learning_rate": 0.1
+        },
+        "xgboost": {
+            "objective": "binary:logistic",
+            "eval_metric": "auc",
+            "verbosity": 0,
+            "seed": 42,
+            "n_estimators": 100,
+            "learning_rate": 0.1
+        },
+        "catboost": {
+            "objective": "Logloss",
+            "eval_metric": "AUC",
+            "verbose": 0,
+            "random_seed": 42,
+            "iterations": 100,
+            "learning_rate": 0.1
+        }
+    }
+    
+    # Use default parameters if none provided
+    if params is None:
+        params = default_params.get(model_type, {})
+    else:
+        # Update default parameters with provided ones
+        model_defaults = default_params.get(model_type, {})
+        for key, value in model_defaults.items():
+            if key not in params:
+                params[key] = value
+    
+    # Add GPU parameters if requested
+    if use_gpu:
+        if model_type == "lightgbm":
+            params["device"] = "gpu"
+        elif model_type == "xgboost":
+            params["tree_method"] = "gpu_hist"
+        elif model_type == "catboost":
+            params["task_type"] = "GPU"
+    
+    # Train the model based on type
+    model = None
+    if model_type == "lightgbm":
+        import lightgbm as lgb
+        train_data = lgb.Dataset(X_train, label=y_train)
+        model = lgb.train(params, train_data)
+    
+    elif model_type == "xgboost":
+        import xgboost as xgb
+        dtrain = xgb.DMatrix(X_train, label=y_train)
+        model = xgb.train(params, dtrain)
+    
+    elif model_type == "catboost":
+        from catboost import CatBoost, Pool
+        
+        # Identify categorical features
+        cat_features = [i for i, col in enumerate(X_train.columns) 
+                        if X_train[col].dtype == 'object' or X_train[col].dtype.name == 'category']
+        
+        # Create pool with categorical features
+        train_pool = Pool(X_train, y_train, cat_features=cat_features)
+        
+        # Initialize and train model
+        model = CatBoost(params)
+        model.fit(train_pool, verbose=False)
+    
+    else:
+        raise ValueError(f"Unsupported model type: {model_type}")
+    
+    # Make predictions
+    y_pred_proba = None
+    if model_type == "xgboost":
+        dtest = xgb.DMatrix(X_test)
+        y_pred_proba = model.predict(dtest)
+    elif model_type == "catboost":
+        test_pool = Pool(X_test, cat_features=cat_features)
+        y_pred_proba = model.predict_proba(test_pool)[:, 1]
+    else:
+        y_pred_proba = model.predict_proba(X_test)[:, 1] if hasattr(model, 'predict_proba') else model.predict(X_test)
+    
+    # Convert to binary predictions
+    y_pred = (y_pred_proba > 0.5).astype(int)
+    
+    # Calculate metrics
+    metrics = calculate_metrics(y_test, y_pred, y_pred_proba)
+    
+    # Log to MLflow
+    log_model_to_mlflow(
+        model=model,
+        model_type=model_type,
+        params=params,
+        metrics=metrics,
+        training_params={"use_gpu": use_gpu},
+        feature_names=X_train.columns.tolist(),
+        data_source="trained_model",
+        tags={"training_type": "classic"}
+    )
+    
+    return model, metrics
+
+def calculate_metrics(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    y_pred_proba: np.ndarray
+) -> Dict[str, Any]:
+    """
+    Calculate evaluation metrics for a model.
+    
+    Parameters
+    ----------
+    y_true : np.ndarray
+        True target values
+    y_pred : np.ndarray
+        Predicted target values
+    y_pred_proba : np.ndarray
+        Predicted probabilities
+        
+    Returns
+    -------
+    Dict[str, Any]
+        Dictionary of evaluation metrics
+    """
+    metrics = {}
+    
+    # Core metrics
+    metrics["auc"] = roc_auc_score(y_true, y_pred_proba)
+    metrics["accuracy"] = accuracy_score(y_true, y_pred)
+    metrics["precision"] = precision_score(y_true, y_pred, zero_division=0)
+    metrics["recall"] = recall_score(y_true, y_pred, zero_division=0)
+    metrics["f1"] = f1_score(y_true, y_pred, zero_division=0)
+    
+    # Calculate ROC curve
+    fpr, tpr, _ = roc_curve(y_true, y_pred_proba)
+    metrics["roc_curve"] = {"fpr": fpr, "tpr": tpr}
+    
+    # Calculate confusion matrix
+    cm = confusion_matrix(y_true, y_pred)
+    metrics["confusion_matrix"] = cm
+    
+    return metrics
 
 def create_cv_plot(cv_results: Dict[str, Any], model_type: str) -> go.Figure:
     """
@@ -788,3 +985,272 @@ def load_model_and_selector(
     except Exception as e:
         logger.error(f"Error loading model and selector: {e}")
         raise
+
+def run_hyperparameter_optimization(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_test: pd.DataFrame,
+    y_test: pd.Series,
+    model_type: str = "lightgbm",
+    n_trials: int = 20,
+    timeout: int = 600,
+    metric: str = "auc",
+    use_gpu: bool = False,
+    progress_callback: Callable = None
+) -> Tuple[Dict[str, Any], Any, List[Dict[str, Any]]]:
+    """
+    Run hyperparameter optimization for a model.
+    
+    Parameters
+    ----------
+    X_train : pd.DataFrame
+        Training features
+    y_train : pd.Series
+        Training target
+    X_test : pd.DataFrame
+        Testing features
+    y_test : pd.Series
+        Testing target
+    model_type : str, optional
+        Type of model to train, by default "lightgbm"
+    n_trials : int, optional
+        Number of trials for optimization, by default 20
+    timeout : int, optional
+        Maximum time for optimization in seconds, by default 600
+    metric : str, optional
+        Metric to optimize for, by default "auc"
+    use_gpu : bool, optional
+        Whether to use GPU for training, by default False
+    progress_callback : Callable, optional
+        Callback function for progress updates, by default None
+        
+    Returns
+    -------
+    Tuple[Dict[str, Any], Any, List[Dict[str, Any]]]
+        Best parameters, best model, and optimization history
+    """
+    try:
+        import optuna
+        from optuna.integration import LightGBMPruningCallback, XGBoostPruningCallback
+    except ImportError:
+        logger.error("Optuna is required for hyperparameter optimization")
+        raise ImportError("Optuna is required for hyperparameter optimization")
+    
+    logger.info(f"Starting hyperparameter optimization for {model_type} model")
+    
+    # Store optimization history
+    optimization_history = []
+    best_value = 0.0
+    
+    # Define the objective function for different model types
+    def objective(trial):
+        nonlocal best_value
+        
+        # Define hyperparameter search space based on model type
+        if model_type == "lightgbm":
+            params = {
+                "objective": "binary",
+                "metric": "auc",
+                "verbosity": -1,
+                "seed": 42,
+                "n_estimators": trial.suggest_int("n_estimators", 50, 500),
+                "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+                "max_depth": trial.suggest_int("max_depth", 3, 10),
+                "num_leaves": trial.suggest_int("num_leaves", 8, 128),
+                "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+                "min_child_samples": trial.suggest_int("min_child_samples", 5, 100)
+            }
+            
+            if use_gpu:
+                params["device"] = "gpu"
+            
+            import lightgbm as lgb
+            train_data = lgb.Dataset(X_train, label=y_train)
+            valid_data = lgb.Dataset(X_test, label=y_test, reference=train_data)
+            
+            # Train the model
+            model = lgb.train(
+                params,
+                train_data,
+                valid_sets=[valid_data],
+                verbose_eval=False
+            )
+            
+            # Make predictions
+            y_pred_proba = model.predict(X_test)
+        
+        elif model_type == "xgboost":
+            params = {
+                "objective": "binary:logistic",
+                "eval_metric": "auc",
+                "verbosity": 0,
+                "seed": 42,
+                "n_estimators": trial.suggest_int("n_estimators", 50, 500),
+                "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+                "max_depth": trial.suggest_int("max_depth", 3, 10),
+                "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+                "gamma": trial.suggest_float("gamma", 0, 10),
+                "min_child_weight": trial.suggest_int("min_child_weight", 1, 10)
+            }
+            
+            if use_gpu:
+                params["tree_method"] = "gpu_hist"
+            
+            import xgboost as xgb
+            dtrain = xgb.DMatrix(X_train, label=y_train)
+            dtest = xgb.DMatrix(X_test, label=y_test)
+            
+            # Train the model
+            model = xgb.train(
+                params,
+                dtrain,
+                evals=[(dtest, "test")],
+                verbose_eval=False
+            )
+            
+            # Make predictions
+            y_pred_proba = model.predict(dtest)
+        
+        elif model_type == "catboost":
+            params = {
+                "iterations": trial.suggest_int("iterations", 50, 500),
+                "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+                "depth": trial.suggest_int("depth", 4, 10),
+                "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1, 100, log=True),
+                "rsm": trial.suggest_float("rsm", 0.5, 1.0),
+                "bagging_temperature": trial.suggest_float("bagging_temperature", 0, 10),
+                "random_seed": 42,
+                "verbose": 0
+            }
+            
+            if use_gpu:
+                params["task_type"] = "GPU"
+            
+            from catboost import CatBoost, Pool
+            
+            # Identify categorical features
+            cat_features = [i for i, col in enumerate(X_train.columns) 
+                            if X_train[col].dtype == 'object' or X_train[col].dtype.name == 'category']
+            
+            # Create pools
+            train_pool = Pool(X_train, y_train, cat_features=cat_features)
+            test_pool = Pool(X_test, y_test, cat_features=cat_features)
+            
+            # Initialize and train model
+            model = CatBoost(params)
+            model.fit(train_pool, eval_set=test_pool, verbose=False)
+            
+            # Make predictions
+            y_pred_proba = model.predict_proba(test_pool)[:, 1]
+        
+        else:
+            raise ValueError(f"Unsupported model type: {model_type}")
+        
+        # Calculate the selected metric
+        if metric == "auc":
+            value = roc_auc_score(y_test, y_pred_proba)
+        elif metric == "accuracy":
+            y_pred = (y_pred_proba > 0.5).astype(int)
+            value = accuracy_score(y_test, y_pred)
+        elif metric == "f1":
+            y_pred = (y_pred_proba > 0.5).astype(int)
+            value = f1_score(y_test, y_pred)
+        else:
+            # Default to AUC
+            value = roc_auc_score(y_test, y_pred_proba)
+        
+        # Update best value and call progress callback if provided
+        if value > best_value:
+            best_value = value
+        
+        if progress_callback:
+            progress_callback(trial.number + 1, n_trials, best_value)
+        
+        # Store trial information
+        optimization_history.append({
+            "trial": trial.number,
+            "value": value,
+            "params": trial.params.copy()
+        })
+        
+        return value
+    
+    # Create a study and optimize
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective, n_trials=n_trials, timeout=timeout)
+    
+    # Get best parameters and train final model with them
+    best_params = study.best_params
+    logger.info(f"Best parameters: {best_params}")
+    
+    # Add default parameters not included in the search space
+    if model_type == "lightgbm":
+        best_params["objective"] = "binary"
+        best_params["metric"] = "auc"
+        best_params["verbosity"] = -1
+        best_params["seed"] = 42
+        
+        if use_gpu:
+            best_params["device"] = "gpu"
+        
+        import lightgbm as lgb
+        train_data = lgb.Dataset(X_train, label=y_train)
+        final_model = lgb.train(best_params, train_data)
+    
+    elif model_type == "xgboost":
+        best_params["objective"] = "binary:logistic"
+        best_params["eval_metric"] = "auc"
+        best_params["verbosity"] = 0
+        best_params["seed"] = 42
+        
+        if use_gpu:
+            best_params["tree_method"] = "gpu_hist"
+        
+        import xgboost as xgb
+        dtrain = xgb.DMatrix(X_train, label=y_train)
+        final_model = xgb.train(best_params, dtrain)
+    
+    elif model_type == "catboost":
+        best_params["random_seed"] = 42
+        best_params["verbose"] = 0
+        
+        if use_gpu:
+            best_params["task_type"] = "GPU"
+        
+        from catboost import CatBoost, Pool
+        
+        # Identify categorical features
+        cat_features = [i for i, col in enumerate(X_train.columns) 
+                        if X_train[col].dtype == 'object' or X_train[col].dtype.name == 'category']
+        
+        # Create pools
+        train_pool = Pool(X_train, y_train, cat_features=cat_features)
+        
+        # Initialize and train model
+        final_model = CatBoost(best_params)
+        final_model.fit(train_pool, verbose=False)
+    
+    # Log optimization results to MLflow
+    log_model_to_mlflow(
+        model=final_model,
+        model_type=model_type,
+        params=best_params,
+        metrics={"best_" + metric: study.best_value},
+        training_params={
+            "use_gpu": use_gpu,
+            "n_trials": n_trials,
+            "timeout": timeout,
+            "optimization_metric": metric
+        },
+        feature_names=X_train.columns.tolist(),
+        data_source="optimized_model",
+        tags={
+            "training_type": "hyperopt",
+            "n_trials": str(n_trials),
+            "best_trial": str(study.best_trial.number)
+        }
+    )
+    
+    return best_params, final_model, optimization_history

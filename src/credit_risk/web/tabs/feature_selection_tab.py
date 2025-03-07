@@ -11,25 +11,36 @@ import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
 import plotly.express as px
-from typing import Dict, Any, Tuple, List, Optional
+from typing import Dict, Any, Tuple, List, Optional, Callable
 from datetime import datetime
-import os
+from pathlib import Path
 
 from credit_risk.web.model_utils import (
-    perform_feature_selection,
-    create_feature_score_plots
+    perform_feature_selection
 )
 from credit_risk.utils.streamlit_utils import (
     prepare_dataframe_for_streamlit,
     save_step_data,
     load_step_data,
     get_available_step_data,
-    DATA_DIR
+    cleanup_corrupted_files
 )
+
+# Import data profiler for automatic checkpointing
+from credit_risk.utils.data_profiling import DataProfiler
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Initialize the data profiler as a session state object (persistent across reruns)
+def get_data_profiler():
+    """Initialize or retrieve the DataProfiler from session state."""
+    if 'data_profiler' not in st.session_state:
+        # Create a checkpoint directory within the data directory
+        checkpoint_dir = Path.cwd() / 'data' / 'profiling_checkpoints'
+        st.session_state.data_profiler = DataProfiler(checkpoint_dir=checkpoint_dir)
+    return st.session_state.data_profiler
 
 def render_feature_selection_tab(data: pd.DataFrame):
     """
@@ -41,6 +52,11 @@ def render_feature_selection_tab(data: pd.DataFrame):
         Data to perform feature selection on
     """
     st.header("Feature Selection")
+    
+    # Check if we have data to work with
+    if data is None:
+        st.warning("No feature data available. Please run Feature Engineering first.")
+        return
     
     # Educational content in an expander
     with st.expander("About Feature Selection", expanded=False):
@@ -70,45 +86,14 @@ def render_feature_selection_tab(data: pd.DataFrame):
         
         # Simple diagram explaining null importance
         try:
-            st.image("https://i.imgur.com/XXvAYKA.png", caption="Null Importance Method", use_column_width=True)
+            st.image("https://i.imgur.com/XXvAYKA.png", caption="Null Importance Method", use_container_width=True)
         except:
             st.write("Null importance compares feature importance between real data and randomized target data.")
-        
-    # Check if we have data to work with
-    if data is None:
-        st.warning("No feature data available. Please run Feature Engineering first.")
-        return
     
     # Show existing results or run new feature selection
     feature_selection_results = st.session_state.get("feature_selection_results")
     
     if feature_selection_results is None:
-        # Check for existing saved feature selection results
-        available_data = get_available_step_data("feature_selection")
-        
-        if available_data:
-            st.info("Found existing feature selection results. You can load them or run a new selection.")
-            
-            # Create selectbox for available feature selection results
-            result_options = []
-            for timestamp, description in available_data.items():
-                result_options.append(f"{timestamp} - {description}")
-            
-            selected_result = st.selectbox(
-                "Load existing feature selection",
-                options=result_options,
-                help="Select previously saved feature selection results to load"
-            )
-            
-            if st.button("Load Selected Results"):
-                with st.spinner("Loading feature selection results..."):
-                    # Extract timestamp from selection
-                    timestamp = selected_result.split(" - ")[0]
-                    feature_selection_results = load_step_data("feature_selection", timestamp)
-                    st.session_state["feature_selection_results"] = feature_selection_results
-                    st.success("Feature selection results loaded successfully!")
-                    st.rerun()
-        
         # Create tabs for new feature selection
         feature_tabs = st.tabs(["Basic Settings", "Advanced Settings", "Run Feature Selection"])
         
@@ -198,17 +183,21 @@ def render_feature_selection_tab(data: pd.DataFrame):
                             step=0.1,
                             help="Number of standard deviations above mean null importance"
                         )
-                    else:  # threshold
-                        threshold_value = st.slider(
-                            "Absolute Threshold",
+                    else:
+                        # Direct threshold setting
+                        importance_threshold = st.slider(
+                            "Importance Threshold",
                             min_value=0.0,
-                            max_value=1.0,
-                            value=0.1,
-                            step=0.01,
-                            help="Absolute importance score threshold"
+                            max_value=0.1,
+                            value=0.005,
+                            step=0.001,
+                            help="Minimum importance score to keep a feature"
                         )
+                        n_runs = 1
+                        threshold_method = "threshold"
+                        threshold_value = importance_threshold
             else:
-                # Simple feature importance settings
+                # Feature importance method settings
                 importance_threshold = st.slider(
                     "Importance Threshold",
                     min_value=0.0,
@@ -282,9 +271,9 @@ def render_feature_selection_tab(data: pd.DataFrame):
             
             # Button to run feature selection
             description = st.text_input(
-                "Description for this feature selection run",
+                "Description",
                 value=f"Feature selection with {selection_method} method",
-                help="A brief description to identify these results later"
+                help="A brief description for your reference"
             )
             
             start_button = st.button(
@@ -357,32 +346,80 @@ def render_feature_selection_tab(data: pd.DataFrame):
                         # Process the results
                         selected_features = feature_selector[0].columns.tolist()
                         
+                        # Create X_train and X_test with proper types
+                        X_train = feature_selector[0].copy().reset_index(drop=True)
+                        X_test = pd.DataFrame(X[feature_selector[0].columns], index=X.index).copy().reset_index(drop=True)
+                        
+                        # Convert COUNT columns to numeric to avoid issues with LightGBM
+                        count_columns = [col for col in selected_features if col.startswith('COUNT(')]
+                        if count_columns:
+                            logger.info(f"Converting {len(count_columns)} COUNT columns to numeric types")
+                            for col in count_columns:
+                                try:
+                                    # Convert to numeric, coerce errors to NaN
+                                    X_train[col] = pd.to_numeric(X_train[col], errors='coerce')
+                                    X_train[col] = X_train[col].fillna(0)
+                                    X_train[col] = X_train[col].astype('int64')
+                                    
+                                    X_test[col] = pd.to_numeric(X_test[col], errors='coerce')
+                                    X_test[col] = X_test[col].fillna(0)
+                                    X_test[col] = X_test[col].astype('int64')
+                                except Exception as e:
+                                    logger.warning(f"Could not convert {col} to numeric: {str(e)}")
+                        
                         # Create results dictionary
                         feature_selection_results = {
                             "selected_features": selected_features,
                             "feature_scores": feature_selector[2].get("feature_scores"),
                             "params": params,
-                            "feature_score_plots": create_feature_score_plots(feature_selector[2].get("feature_scores")),
                             # Add the split data to feature_selection_results for model_training_tab.py
-                            "X_train": feature_selector[0],  # Selected features DataFrame
-                            "y_train": y,
-                            "X_test": pd.DataFrame(X[feature_selector[0].columns], index=X.index),
-                            "y_test": y
+                            "X_train": X_train,  # Selected features DataFrame
+                            "y_train": y.copy().reset_index(drop=True),
+                            "X_test": X_test,
+                            "y_test": y.copy().reset_index(drop=True)
                         }
                         
                         # Record end time and calculate duration
                         end_time = time.time()
                         duration = end_time - start_time
                         
-                        # Save feature selection results
+                        # Add timestamp and description to results
                         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                         feature_selection_results["timestamp"] = timestamp
                         feature_selection_results["description"] = description
                         feature_selection_results["duration"] = duration
                         
-                        # Save to session state and to file
-                        st.session_state["feature_selection_results"] = feature_selection_results
-                        save_step_data("feature_selection", feature_selection_results, description)
+                        # Prepare results dictionary
+                        fs_results = {
+                            "selected_features": selected_features,
+                            "feature_scores": feature_selector[2].get("feature_scores"),
+                            "params": params,
+                            "X_train": X_train,
+                            "y_train": y.copy().reset_index(drop=True),
+                            "X_test": X_test,  # Include X_test
+                            "y_test": y.copy().reset_index(drop=True),  # Include y_test
+                            "X_selected": X_train[selected_features],
+                            "timestamp": timestamp,
+                            "duration": duration,
+                            "description": description
+                        }
+                        
+                        # Save to session state and file
+                        st.session_state["feature_selection_results"] = fs_results
+                        save_step_data("feature_selection", fs_results, description)
+                        
+                        # Profile the selected features dataset
+                        try:
+                            profiler = get_data_profiler()
+                            profiler.create_checkpoint(
+                                stage="feature_selection",
+                                X=X_train[selected_features],
+                                y=y.copy().reset_index(drop=True),
+                                description=f"Selected features: {len(selected_features)} features"
+                            )
+                            st.info("Feature selection profile created. Compare with previous stages in the Data Profiling tab.")
+                        except Exception as e:
+                            logger.error(f"Error creating feature selection profile: {str(e)}")
                         
                         # Show success message
                         st.success(f"Feature selection completed in {duration:.1f} seconds!")
@@ -394,9 +431,11 @@ def render_feature_selection_tab(data: pd.DataFrame):
         # Display feature selection results
         display_feature_selection_results(feature_selection_results, data)
         
-        # Add button to clear results and run new selection
-        if st.button("Clear Results and Run New Selection"):
-            del st.session_state["feature_selection_results"]
+        # Add single button to clear results and run new selection
+        if st.button("Clear Results and Run New Selection", key="clear_results_button", use_container_width=True):
+            # Completely remove feature selection results from session state
+            if "feature_selection_results" in st.session_state:
+                del st.session_state["feature_selection_results"]
             st.rerun()
 
 def display_feature_selection_results(results: Dict[str, Any], original_data: pd.DataFrame):
@@ -418,147 +457,115 @@ def display_feature_selection_results(results: Dict[str, Any], original_data: pd
     timestamp = results.get("timestamp", "unknown")
     duration = results.get("duration", 0)
     
-    # Create a dashboard layout
-    st.write(f"### {description}")
-    st.write(f"Run on: {timestamp.replace('_', ' ')} (took {duration:.1f} seconds)")
+    # Set up header with key metrics
+    st.write("## Feature Selection Results")
     
-    # Display metrics
-    metrics_col1, metrics_col2, metrics_col3 = st.columns(3)
+    # Summary metrics in columns
+    col1, col2, col3 = st.columns(3)
     
-    with metrics_col1:
+    with col1:
         st.metric("Selected Features", len(selected_features))
     
-    with metrics_col2:
-        st.metric("Feature Reduction", f"{(1 - len(selected_features) / len(original_data.columns)) * 100:.1f}%")
+    with col2:
+        # Calculate feature reduction percentage
+        if original_data is not None and len(original_data.columns) > 0:
+            total_features = len(original_data.columns)
+            reduction = 100 * (1 - len(selected_features) / total_features)
+            st.metric("Feature Reduction", f"{reduction:.1f}%")
+        else:
+            st.metric("Feature Reduction", "N/A")
     
-    with metrics_col3:
-        if method == "null_importance":
-            n_runs = results.get("params", {}).get("n_runs", 0)
-            st.metric("Null Importance Runs", n_runs)
+    with col3:
+        st.metric("Selection Method", method.replace("_", " ").title())
+    
+    # Additional information
+    st.info(f"**📊 Details:** {description}\n\n**🕒 Generated:** {timestamp.replace('_', ' ')} (took {duration:.1f} seconds)")
     
     # Create tabs for different views of the results
-    results_tabs = st.tabs(["Feature Scores", "Selected Features", "Feature Distributions"])
+    results_tabs = st.tabs(["Selected Features", "Feature Importance", "Data Preview"])
     
-    # Feature Scores tab
     with results_tabs[0]:
-        st.subheader("Feature Importance Scores")
+        st.subheader("Selected Features List")
         
-        if method == "null_importance" and "feature_score_plots" in results:
-            # Display the feature score plots created during feature selection
-            for fig_title, fig in results["feature_score_plots"].items():
-                st.write(f"#### {fig_title}")
-                try:
-                    # Check if this is a Plotly figure
-                    if hasattr(fig, 'update_layout'):
-                        st.plotly_chart(fig, use_container_width=True)
-                    else:
-                        # Assume it's a matplotlib figure if not a Plotly figure
-                        st.pyplot(fig)
-                except Exception as e:
-                    st.error(f"Error displaying plot: {str(e)}")
-                    st.write("Plot data available but could not be displayed.")
-        
-        # Show feature scores table
-        if feature_scores is not None:
-            # Prepare table of feature scores
-            if isinstance(feature_scores, pd.DataFrame):
-                score_df = feature_scores
-            else:
-                # Convert to DataFrame if it's a dict or other format
-                score_df = pd.DataFrame({
-                    "Feature": list(feature_scores.keys()),
-                    "Score": list(feature_scores.values())
-                }).sort_values("Score", ascending=False)
+        # Create a dataframe with more information about selected features
+        if selected_features and feature_scores is not None:
+            # Create a dataframe with selected features and their scores
+            feature_df = pd.DataFrame({
+                'Feature': selected_features
+            })
             
-            st.write("#### Feature Scores Table")
-            st.dataframe(
-                prepare_dataframe_for_streamlit(score_df),
-                use_container_width=True
-            )
-    
-    # Selected Features tab
-    with results_tabs[1]:
-        st.subheader("Selected Features")
-        
-        # Group features by type or source
-        if any("(" in f for f in selected_features):
-            # Features likely have source information in them
-            feature_types = {}
-            for feature in selected_features:
-                if "(" in feature:
-                    feature_type = feature.split("(")[1].split(")")[0].split(".")[0]
-                    if feature_type not in feature_types:
-                        feature_types[feature_type] = []
-                    feature_types[feature_type].append(feature)
-                else:
-                    if "Other" not in feature_types:
-                        feature_types["Other"] = []
-                    feature_types["Other"].append(feature)
+            # Try to add importance scores if available
+            if isinstance(feature_scores, dict):
+                # Try different possible keys for the scores
+                for key in ['importance_gain', 'importance_split', 'final_score', 'score']:
+                    if key in feature_scores and len(feature_scores[key]) > 0:
+                        score_dict = {feat: score for feat, score in zip(feature_scores.get('feature', selected_features), feature_scores[key])}
+                        feature_df['Score'] = feature_df['Feature'].map(score_dict).fillna(0)
+                        break
+                
+                # Sort by score if available
+                if 'Score' in feature_df.columns:
+                    feature_df = feature_df.sort_values('Score', ascending=False)
             
-            # Display features by type
-            for feature_type, features in sorted(feature_types.items()):
-                with st.expander(f"{feature_type} ({len(features)} features)", expanded=False):
-                    st.write(", ".join(sorted(features)))
+            # Display the dataframe
+            st.dataframe(feature_df, use_container_width=True)
         else:
-            # Just show the list of selected features
-            st.write(", ".join(sorted(selected_features)))
-        
-        # Download button for selected features
-        features_csv = "\n".join(selected_features)
-        st.download_button(
-            "Download Selected Features",
-            features_csv,
-            file_name=f"selected_features_{timestamp}.csv",
-            mime="text/csv"
-        )
+            st.warning("No selected features data available. Results may be in an unexpected format.")
     
-    # Feature Distributions tab
-    with results_tabs[2]:
-        st.subheader("Feature Distributions")
+    with results_tabs[1]:
+        st.subheader("Feature Importance")
         
-        # Allow user to select features to visualize
-        selected_viz_features = st.multiselect(
-            "Select features to visualize",
-            options=selected_features,
-            default=selected_features[:min(5, len(selected_features))],
-            help="Select features to view their distributions"
-        )
-        
-        if selected_viz_features:
-            # Check if we have target column for stratification
-            has_target = "TARGET" in original_data.columns
-            
-            for feature in selected_viz_features:
-                if feature in original_data.columns:
-                    st.write(f"#### {feature}")
+        # Check if we have the necessary data for plots
+        if feature_scores is not None:
+            # Try to create feature importance plots
+            try:
+                # Display importance plot
+                if isinstance(feature_scores, dict) and 'final_score' in feature_scores:
+                    # Prepare data for Plotly
+                    importance_df = pd.DataFrame({
+                        'Feature': feature_scores.get('feature', []),
+                        'Importance': feature_scores.get('final_score', [])
+                    }).sort_values('Importance', ascending=False).head(30)
                     
-                    try:
-                        # Create a distribution plot
-                        if has_target:
-                            fig = px.histogram(
-                                original_data, 
-                                x=feature,
-                                color="TARGET",
-                                barmode="overlay",
-                                opacity=0.7,
-                                marginal="box"
-                            )
-                        else:
-                            fig = px.histogram(
-                                original_data, 
-                                x=feature,
-                                opacity=0.7,
-                                marginal="box"
-                            )
-                        
-                        # Update layout
-                        fig.update_layout(
-                            height=400,
-                            width=700
+                    if len(importance_df) > 0:
+                        # Create bar chart
+                        import plotly.express as px
+                        fig = px.bar(
+                            importance_df,
+                            x='Importance',
+                            y='Feature',
+                            orientation='h',
+                            title='Top 30 Features by Importance',
+                            color='Importance',
+                            color_continuous_scale='Viridis'
                         )
-                        
+                        fig.update_layout(yaxis={'categoryorder': 'total ascending'})
                         st.plotly_chart(fig, use_container_width=True)
-                    except Exception as e:
-                        st.error(f"Could not plot {feature}: {str(e)}")
                 else:
-                    st.warning(f"Feature {feature} not found in the original data") 
+                    st.info("Feature importance plot could not be created with the available data format.")
+            except Exception as e:
+                st.error(f"Error creating feature importance plot: {str(e)}")
+        else:
+            st.warning("No feature importance data available.")
+    
+    with results_tabs[2]:
+        st.subheader("Data with Selected Features")
+        
+        # Show a preview of the data with only selected features
+        if original_data is not None and len(selected_features) > 0:
+            # Filter columns to only show selected features (plus TARGET if it exists)
+            available_columns = set(original_data.columns)
+            columns_to_show = [col for col in selected_features if col in available_columns]
+            
+            if 'TARGET' in available_columns and 'TARGET' not in columns_to_show:
+                columns_to_show.append('TARGET')
+            
+            # Create filtered dataframe
+            if columns_to_show:
+                filtered_df = original_data[columns_to_show].copy()
+                st.dataframe(prepare_dataframe_for_streamlit(filtered_df.head(10)), use_container_width=True)
+                st.caption(f"Showing first 10 rows with {len(columns_to_show)} selected features")
+            else:
+                st.warning("None of the selected features are available in the current dataset.")
+        else:
+            st.warning("Data preview is not available.") 

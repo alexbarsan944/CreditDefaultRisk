@@ -312,18 +312,15 @@ def run_feature_engineering(config, datasets):
     Returns:
         DataFrame with generated features or None if an error occurred
     """
-    st.header("Feature Engineering")
-    
     # Check if datasets are loaded
     if not datasets:
-        st.error("No datasets loaded. Please load data first.")
+        logger.error("No datasets loaded for feature engineering")
         return None
     
-    # Show dataset sizes being used
-    total_rows = sum(len(df) for df in datasets.values())
-    st.info(f"Running feature engineering on {len(datasets)} datasets with {total_rows:,} total rows")
-    
     # Log dataset sizes
+    total_rows = sum(len(df) for df in datasets.values())
+    logger.info(f"Running feature engineering on {len(datasets)} datasets with {total_rows:,} total rows")
+    
     for name, df in datasets.items():
         logger.info(f"Feature engineering dataset: {name} with {len(df):,} rows, {df.shape[1]} columns")
     
@@ -333,272 +330,130 @@ def run_feature_engineering(config, datasets):
     # Get application data
     app_df = datasets.get("application_train")
     if app_df is None:
-        st.error("Application train dataset not found")
+        logger.error("Application train dataset not found")
         return None
     
     # Preprocess data
-    with st.spinner("Preprocessing data..."):
-        st.text("Dropping low importance columns...")
-        app_df = preprocessor.drop_low_importance_columns(app_df)
+    logger.info("Preprocessing data...")
+    app_df = preprocessor.drop_low_importance_columns(app_df)
+    app_df = preprocessor.handle_missing_values(app_df)
         
-        st.text("Handling missing values...")
-        app_df = preprocessor.handle_missing_values(app_df)
-        
-        # Update the dataset
-        datasets["application_train"] = app_df
+    # Update the dataset
+    datasets["application_train"] = app_df
     
-    # Create feature engineer
+    # Create feature engineer with forced single process configuration
     try:
+        # Force config to use single process
+        config.features.n_jobs = 1
+        
+        # Disable GPU to prevent issues
+        config.gpu.processing_backend = ProcessingBackend.CPU
+        
+        # Disable Dask distributed
+        import os  # Import here to ensure it's available
+        os.environ["FEATURETOOLS_NO_DASK"] = "1"
+        
         engineer = FeatureEngineer(config=config)
     except Exception as e:
-        logger.warning(f"Error initializing FeatureEngineer: {str(e)}, falling back to CPU")
-        st.warning(f"Error initializing FeatureEngineer: {str(e)}, falling back to CPU")
+        logger.warning(f"Error initializing FeatureEngineer: {str(e)}, falling back to basic config")
         config.gpu.processing_backend = ProcessingBackend.CPU
-        engineer = FeatureEngineer(config=config)
+        engineer = FeatureEngineer()
     
-    # Add manual features
-    with st.spinner("Creating manual features..."):
-        st.text("Adding manual features...")
-        app_df = engineer.create_manual_features(
-            app_df=app_df,
-            bureau_df=datasets.get("bureau"),
-            previous_df=datasets.get("previous_application"),
-            installments_df=datasets.get("installments_payments")
+    # Generate manual features
+    logger.info("Creating manual features...")
+    
+    # Try to get categorical columns for one-hot encoding
+    cat_cols = app_df.select_dtypes(include=["object", "category"]).columns.tolist()
+    
+    # Generate manual features
+    try:
+        manual_features = engineer.create_manual_features(app_df)
+        logger.info(f"Created {manual_features.shape[1]} manual features")
+    except Exception as e:
+        logger.error(f"Error creating manual features: {str(e)}")
+        manual_features = app_df.copy()
+    
+    # Generate automatic features using featuretools with single process mode
+    logger.info(f"Generating features with max_depth={config.features.max_depth}, primitives={config.features.default_agg_primitives}")
+    
+    try:
+        # Try with simplified parameters
+        features = engineer.generate_features(
+            datasets,
+            # Force single process parameters
+            n_jobs=1,
+            chunk_size=None
         )
         
-        # Update the dataset
-        datasets["application_train"] = app_df
+        # Check the shape of returned features
+        if isinstance(features, tuple) and len(features) >= 1 and isinstance(features[0], pd.DataFrame):
+            logger.info("Features were returned as a tuple, extracting DataFrame")
+            features_df = features[0]
+        elif isinstance(features, pd.DataFrame):
+            features_df = features
+        else:
+            logger.error(f"Unexpected type returned from feature generation: {type(features)}")
+            return None
         
-        st.success(f"Created manual features. Total features: {app_df.shape[1]}")
-    
-    # Generate automated features
-    with st.spinner("Generating automated features..."):
-        st.text(f"Generating features with max_depth={config.features.max_depth}...")
+        logger.info(f"Generated {features_df.shape[1]} features with featuretools")
         
-        # Track with MLflow if enabled
-        tracker = ExperimentTracker(config=config)
+        # Combine manual and automatic features
+        final_features = pd.concat([manual_features, features_df], axis=1)
         
-        with tracker.start_run(run_name="feature_engineering"):
-            # Log run parameters
-            tracker.log_params({
-                "run_mode": config.run_mode.value,
-                "sample_size": config.data.sample_size,
-                "max_depth": config.features.max_depth,
-                "backend": str(config.gpu.processing_backend),
-            })
-            
-            # Generate features
-            try:
-                # Use configuration settings for performance
-                chunk_size = config.features.chunk_size
-                if chunk_size is None and config.data.sample_size > 10000:
-                    chunk_size = 10000  # Default chunk size for large datasets
-                
-                features_result = engineer.generate_features(
-                    datasets=datasets,
-                    max_depth=config.features.max_depth,
-                    verbose=True,
-                    chunk_size=chunk_size,
-                    n_jobs=config.features.n_jobs
-                )
-                
-                # Handle the case where featuretools returns a tuple
-                if isinstance(features_result, tuple):
-                    logger.info("Features were returned as a tuple, extracting DataFrame")
-                    features_df = features_result[0]  # Extract DataFrame from tuple
-                else:
-                    features_df = features_result
-                
-                # Log feature stats
-                tracker.log_metrics({
-                    "num_features": features_df.shape[1],
-                    "num_samples": features_df.shape[0],
-                })
-                
-                # Save features to feature store
-                store = FeatureStore(config=config)
-                feature_set_name = f"features_depth{config.features.max_depth}"
-                store.save_feature_set(
-                    features=features_df,
-                    name=feature_set_name,
-                    description=f"Features with max_depth={config.features.max_depth}",
-                    tags=["web_app", config.run_mode.value],
-                    metadata={
-                        "max_depth": config.features.max_depth,
-                        "run_mode": config.run_mode.value,
-                    }
-                )
-                
-                st.success(f"Generated {features_df.shape[1]} features")
-                
-                # Display detailed statistics
-                with st.expander("Feature Engineering Statistics", expanded=True):
-                    # Create two columns for stats
-                    col1, col2 = st.columns(2)
+        # Remove duplicate columns
+        final_features = final_features.loc[:, ~final_features.columns.duplicated()]
+        logger.info(f"Final feature set: {final_features.shape[1]} features")
+        
+        # Convert COUNT columns to numeric types to avoid LightGBM errors
+        count_columns = [col for col in final_features.columns if col.startswith('COUNT(')]
+        if count_columns:
+            logger.info(f"Converting {len(count_columns)} COUNT columns to numeric types")
+            for col in count_columns:
+                try:
+                    # Convert to numeric, coerce errors to NaN
+                    final_features[col] = pd.to_numeric(final_features[col], errors='coerce')
+                    # Fill NaN values with 0
+                    final_features[col] = final_features[col].fillna(0)
+                    # Convert to int64 for cleaner representation
+                    final_features[col] = final_features[col].astype('int64')
+                except Exception as e:
+                    logger.warning(f"Could not convert {col} to numeric: {str(e)}")
+        
+        # Ensure the TARGET column is preserved without NaNs
+        if 'TARGET' in app_df.columns:
+            # Check if TARGET is already in the final features
+            if 'TARGET' in final_features.columns:
+                # Check for NaN values
+                nan_count = final_features['TARGET'].isna().sum()
+                if nan_count > 0:
+                    logger.warning(f"Found {nan_count} NaN values in TARGET column after feature engineering")
                     
-                    with col1:
-                        st.subheader("Dataset Information")
-                        st.write(f"Number of rows: {features_df.shape[0]}")
-                        st.write(f"Total features: {features_df.shape[1]}")
-                        
-                        # Original vs new features - correctly identify app_train columns as original
-                        app_train_df = datasets.get("application_train", pd.DataFrame())
-                        
-                        # To get the true original column count, we need to check the raw file
-                        # as some columns might have been dropped during preprocessing
-                        try:
-                            raw_app_df = pd.read_csv(f"{config.data.raw_data_path}/application_train.csv")
-                            original_cols = raw_app_df.shape[1]
-                        except Exception as e:
-                            # Fallback to the current dataframe if raw file can't be loaded
-                            logger.warning(f"Could not load raw application_train.csv: {str(e)}")
-                            original_cols = len(app_train_df.columns) if not app_train_df.empty else 0
-                        
-                        # Output the actual count
-                        st.write(f"Original features: {original_cols}")
-                        st.write(f"New features: {max(0, features_df.shape[1] - original_cols)}")
+                    # Option 1: Drop rows with NaN in TARGET
+                    # final_features = final_features.dropna(subset=['TARGET'])
                     
-                    with col2:
-                        st.subheader("Feature Types")
-                        # Count feature types
-                        numeric_cols = len(features_df.select_dtypes(include=['number']).columns)
-                        categorical_cols = len(features_df.select_dtypes(include=['category', 'object']).columns)
-                        bool_cols = len(features_df.select_dtypes(include=['bool']).columns)
-                        date_cols = len(features_df.select_dtypes(include=['datetime']).columns)
-                        other_cols = features_df.shape[1] - numeric_cols - categorical_cols - bool_cols - date_cols
-                        
-                        st.write(f"Numeric features: {numeric_cols}")
-                        st.write(f"Categorical features: {categorical_cols}")
-                        st.write(f"Boolean features: {bool_cols}")
-                        st.write(f"Date/time features: {date_cols}")
-                        if other_cols > 0:
-                            st.write(f"Other types: {other_cols}")
-                    
-                    # Memory usage information
-                    st.subheader("Memory Usage")
-                    memory_usage = features_df.memory_usage(deep=True).sum() / (1024 * 1024)
-                    st.write(f"Feature matrix memory usage: {memory_usage:.2f} MB")
-                
-                # Sample a subset of features for display
-                st.subheader("Feature Preview")
-                if features_df.shape[1] > 20:
-                    sample_cols = list(features_df.columns[:20])
-                    st.dataframe(prepare_dataframe_for_streamlit(features_df[sample_cols].head()))
-                    st.info(f"Showing {len(sample_cols)} of {features_df.shape[1]} features")
-                else:
-                    st.dataframe(prepare_dataframe_for_streamlit(features_df.head()))
-                
-                return features_df
-                
-            except Exception as e:
-                logger.error(f"Error generating features: {str(e)}")
-                st.error(f"Error generating features: {str(e)}")
-                
-                # Try again with CPU if we're not already using it
-                if config.gpu.processing_backend != ProcessingBackend.CPU:
-                    st.warning("Trying again with CPU backend...")
-                    try:
-                        config.gpu.processing_backend = ProcessingBackend.CPU
-                        engineer = FeatureEngineer(config=config)
-                        
-                        # For CPU fallback, use conservative settings to avoid memory issues
-                        reduced_n_jobs = 1  # Use single process to minimize memory usage
-                        
-                        # Calculate a reasonable chunk size based on dataset size
-                        app_df = datasets.get("application_train")
-                        if app_df is not None:
-                            auto_chunk_size = min(5000, app_df.shape[0] // 2)
-                        else:
-                            auto_chunk_size = 5000
-                            
-                        logger.info(f"CPU fallback: Using n_jobs={reduced_n_jobs} and chunk_size={auto_chunk_size}")
-                        
-                        features_result = engineer.generate_features(
-                            datasets=datasets,
-                            max_depth=config.features.max_depth,
-                            verbose=True,
-                            chunk_size=auto_chunk_size,
-                            n_jobs=reduced_n_jobs
-                        )
-                        
-                        # Handle the case where featuretools returns a tuple
-                        if isinstance(features_result, tuple):
-                            logger.info("Features were returned as a tuple, extracting DataFrame")
-                            features_df = features_result[0]  # Extract DataFrame from tuple
-                        else:
-                            features_df = features_result
-                        
-                        # Log feature stats
-                        tracker.log_metrics({
-                            "num_features": features_df.shape[1],
-                            "num_samples": features_df.shape[0],
-                        })
-                        
-                        st.success(f"Generated {features_df.shape[1]} features with CPU backend")
-                        
-                        # Display detailed statistics
-                        with st.expander("Feature Engineering Statistics", expanded=True):
-                            # Create two columns for stats
-                            col1, col2 = st.columns(2)
-                            
-                            with col1:
-                                st.subheader("Dataset Information")
-                                st.write(f"Number of rows: {features_df.shape[0]}")
-                                st.write(f"Total features: {features_df.shape[1]}")
-                                
-                                # Original vs new features - correctly identify app_train columns as original
-                                app_train_df = datasets.get("application_train", pd.DataFrame())
-                                
-                                # To get the true original column count, we need to check the raw file
-                                # as some columns might have been dropped during preprocessing
-                                try:
-                                    raw_app_df = pd.read_csv(f"{config.data.raw_data_path}/application_train.csv")
-                                    original_cols = raw_app_df.shape[1]
-                                except Exception as e:
-                                    # Fallback to the current dataframe if raw file can't be loaded
-                                    logger.warning(f"Could not load raw application_train.csv: {str(e)}")
-                                    original_cols = len(app_train_df.columns) if not app_train_df.empty else 0
-                                
-                                # Output the actual count
-                                st.write(f"Original features: {original_cols}")
-                                st.write(f"New features: {max(0, features_df.shape[1] - original_cols)}")
-                            
-                            with col2:
-                                st.subheader("Feature Types")
-                                # Count feature types
-                                numeric_cols = len(features_df.select_dtypes(include=['number']).columns)
-                                categorical_cols = len(features_df.select_dtypes(include=['category', 'object']).columns)
-                                bool_cols = len(features_df.select_dtypes(include=['bool']).columns)
-                                date_cols = len(features_df.select_dtypes(include=['datetime']).columns)
-                                other_cols = features_df.shape[1] - numeric_cols - categorical_cols - bool_cols - date_cols
-                                
-                                st.write(f"Numeric features: {numeric_cols}")
-                                st.write(f"Categorical features: {categorical_cols}")
-                                st.write(f"Boolean features: {bool_cols}")
-                                st.write(f"Date/time features: {date_cols}")
-                                if other_cols > 0:
-                                    st.write(f"Other types: {other_cols}")
-                            
-                            # Memory usage information
-                            st.subheader("Memory Usage")
-                            memory_usage = features_df.memory_usage(deep=True).sum() / (1024 * 1024)
-                            st.write(f"Feature matrix memory usage: {memory_usage:.2f} MB")
-                        
-                        # Sample a subset of features for display
-                        st.subheader("Feature Preview")
-                        if features_df.shape[1] > 20:
-                            sample_cols = list(features_df.columns[:20])
-                            st.dataframe(prepare_dataframe_for_streamlit(features_df[sample_cols].head()))
-                            st.info(f"Showing {len(sample_cols)} of {features_df.shape[1]} features")
-                        else:
-                            st.dataframe(prepare_dataframe_for_streamlit(features_df.head()))
-                        
-                        return features_df
-                    except Exception as inner_e:
-                        logger.error(f"Error generating features with CPU fallback: {str(inner_e)}")
-                        st.error(f"Error generating features with CPU fallback: {str(inner_e)}")
-                        return None
-                return None
+                    # Option 2: Use TARGET from original dataset to fill NaNs
+                    # This ensures we keep all rows but have valid TARGET values
+                    logger.info("Using original TARGET values from application_train")
+                    # Ensure indices match
+                    matching_indices = final_features.index.intersection(app_df.index)
+                    final_features = final_features.loc[matching_indices]
+                    final_features['TARGET'] = app_df.loc[matching_indices, 'TARGET']
+            else:
+                # If TARGET is not in final_features, add it from app_df
+                logger.info("Adding TARGET column from application_train")
+                # Get common indices
+                matching_indices = final_features.index.intersection(app_df.index)
+                final_features = final_features.loc[matching_indices]
+                final_features['TARGET'] = app_df.loc[matching_indices, 'TARGET']
+        
+        logger.info(f"Final features shape: {final_features.shape}")
+        return final_features
+        
+    except Exception as e:
+        logger.error(f"Error generating features: {str(e)}", exc_info=True)
+        # Return manual features as a fallback
+        logger.info("Returning only manual features due to error in feature generation")
+        return manual_features
 
 
 def show_mlflow_ui():

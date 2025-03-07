@@ -5,8 +5,21 @@ from sklearn.impute import SimpleImputer
 from xgboost import XGBClassifier
 import logging
 from typing import List, Tuple, Dict, Union, Optional
+import warnings
 
 logger = logging.getLogger(__name__)
+
+# Create a context manager to temporarily suppress warnings
+class SuppressWarnings:
+    def __enter__(self):
+        self.original_filters = warnings.filters.copy()
+        warnings.filterwarnings('ignore', category=RuntimeWarning, message='invalid value encountered in')
+        warnings.filterwarnings('ignore', category=RuntimeWarning, message='divide by zero')
+        warnings.filterwarnings('ignore', category=RuntimeWarning, message='Mean of empty slice')
+        return self
+        
+    def __exit__(self, *args):
+        warnings.filters = self.original_filters
 
 class FeatureSelector:
     """
@@ -542,52 +555,66 @@ class FeatureSelector:
                     encoded_cols = [c for c in X_processed.columns if c.startswith(f"{col}_")]
                     for enc_col in encoded_cols:
                         column_mapping[enc_col] = col
-                        
-            # Get the list of feature names
-            feature_names = X_processed.columns.tolist()
             
-            # Create a feature name mapping for consistent reference
-            feature_name_map = {i: name for i, name in enumerate(feature_names)}
-            
-            # Create DataFrame to store null importances
-            null_imp_df = pd.DataFrame()
-            
+            # Store the original feature names before imputation
+            original_feature_names = X_processed.columns.tolist()
+                    
             # Handle missing values in X
             try:
-                # Try mean imputation first
-                logger.info("Applying mean imputation for null importance calculation")
+                # Try mean imputation first - but don't transform yet
+                logger.info("Preparing mean imputer for null importance calculation")
                 imputer = SimpleImputer(strategy="mean")
+                
+                # Check if any columns have all missing values
+                all_missing_cols = []
+                for col in X_processed.columns:
+                    if X_processed[col].isna().all():
+                        all_missing_cols.append(col)
+                
+                if all_missing_cols:
+                    logger.warning(f"Found {len(all_missing_cols)} columns with all missing values: {all_missing_cols[:5]}")
+                    logger.warning("Removing these columns before imputation")
+                    X_processed = X_processed.drop(columns=all_missing_cols)
+                
+                # Fit imputer and transform data
                 X_imputed = imputer.fit_transform(X_processed)
-                logger.info(f"Imputed data shape: {X_imputed.shape}")
+                feature_names = X_processed.columns.tolist()  # Update feature names to match imputed data
+                logger.info(f"Imputed data shape: {X_imputed.shape}, feature count: {len(feature_names)}")
             except Exception as e:
                 logger.warning(f"Error using mean imputation in null importance: {str(e)}. Trying median imputation.")
                 try:
                     # Try median imputation if mean fails
                     imputer = SimpleImputer(strategy="median")
                     X_imputed = imputer.fit_transform(X_processed)
+                    feature_names = X_processed.columns.tolist()
                 except Exception as e2:
                     logger.warning(f"Error using median imputation in null importance: {str(e2)}. Trying constant imputation.")
                     # As a last resort, use constant imputation
                     imputer = SimpleImputer(strategy="constant", fill_value=0)
                     X_imputed = imputer.fit_transform(X_processed)
+                    feature_names = X_processed.columns.tolist()
             
             # Check for shape mismatch between imputed data and feature names
             if X_imputed.shape[1] != len(feature_names):
                 logger.warning(f"Shape mismatch in null importance: Imputed data has {X_imputed.shape[1]} columns but feature_names has {len(feature_names)} elements")
-                # Adjust feature names to match imputed data shape
+                
+                # Ensure feature_names matches the imputed data shape
                 if X_imputed.shape[1] < len(feature_names):
-                    logger.warning(f"Truncating feature names to match imputed data columns")
+                    logger.warning(f"Truncating feature names list to match imputed data ({X_imputed.shape[1]} columns)")
                     feature_names = feature_names[:X_imputed.shape[1]]
                 else:
-                    logger.warning(f"Adding generic feature names to match imputed data columns")
+                    logger.warning(f"Adding generic feature names to match imputed data columns ({X_imputed.shape[1]} columns)")
                     additional_features = [f"feature_{i}" for i in range(len(feature_names), X_imputed.shape[1])]
                     feature_names.extend(additional_features)
-                    
-                # Update feature_name_map with adjusted feature names
-                feature_name_map = {i: name for i, name in enumerate(feature_names)}
             
+            # Create a feature name mapping for consistent reference
+            feature_name_map = {i: name for i, name in enumerate(feature_names)}
+                
             # Create pandas DataFrame to preserve feature names
             X_imputed_df = pd.DataFrame(X_imputed, columns=feature_names)
+            
+            # Create DataFrame to store null importances
+            null_imp_df = pd.DataFrame()
             
             # Check if GPU is available (reuse code pattern from _get_feature_importance)
             gpu_available = False
@@ -885,23 +912,27 @@ class FeatureSelector:
         """
         Identify highly correlated features to remove.
         
-        Parameters:
-        -----------
+        Parameters
+        ----------
         X : pd.DataFrame
-            Feature matrix
+            Feature dataframe
             
-        Returns:
-        --------
+        Returns
+        -------
         List[str]
-            List of feature names to drop
+            List of features to drop
         """
+        logger.info(f"Checking for highly correlated features above threshold {self.correlation_threshold_}")
+        
         # Create correlation matrix and get upper triangle
-        corr_matrix = X.corr().abs()
-        upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+        with SuppressWarnings():
+            corr_matrix = X.corr().abs()
+            upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
         
-        # Find columns with correlations higher than threshold
-        to_drop = [column for column in upper.columns if any(upper[column] > self.correlation_threshold_)]
-        
+            # Find columns with correlations higher than threshold
+            to_drop = [column for column in upper.columns if any(upper[column] > self.correlation_threshold_)]
+            
+        logger.info(f"Found {len(to_drop)} highly correlated features to remove")
         return to_drop
     
     def get_useful_features(self) -> List[str]:

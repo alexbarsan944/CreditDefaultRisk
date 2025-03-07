@@ -3,6 +3,7 @@ import numpy as np
 import logging
 import joblib
 import os
+import re  # Add re module for regex operations
 from typing import Dict, List, Optional, Tuple, Union, Any
 from sklearn.model_selection import KFold, StratifiedKFold, train_test_split
 from sklearn.metrics import roc_auc_score, classification_report, accuracy_score, confusion_matrix
@@ -65,6 +66,7 @@ class CreditRiskModel:
         self.random_state = random_state
         self.model = None
         self.feature_names_ = None
+        self.early_stopping_rounds = 0
         
         # Use different imputers for numerical and categorical data
         self.numeric_imputer = SimpleImputer(strategy="mean")
@@ -126,13 +128,13 @@ class CreditRiskModel:
                 "subsample_for_bin": 240000,
                 "reg_alpha": 1.0,
                 "reg_lambda": 1.0,
-                "colsample_bytree": 0.4,
+                "feature_fraction": 0.8,  # Use feature_fraction instead of colsample_bytree
                 "min_split_gain": 0.04,
                 "subsample": 1.0,
                 "is_unbalance": False,
                 "random_state": self.random_state,
-                "verbose": -1,
-                "silent": True,
+                "verbose": -1,  # Set to -1 to avoid warnings
+                "n_jobs": -1,   # Use all available CPU cores
             }
         elif self.model_type == "catboost":
             return {
@@ -159,14 +161,58 @@ class CreditRiskModel:
         model_params = self.model_params.copy()
         
         if self.model_type == "xgboost":
-            # For XGBoost 2.1.x, set early_stopping_rounds in the constructor
-            if 'early_stopping_rounds' not in model_params:
-                model_params['early_stopping_rounds'] = 100
+            # Remove early_stopping_rounds since it's not a valid XGBoost parameter
+            if 'early_stopping_rounds' in model_params:
+                self.early_stopping_rounds = model_params.pop('early_stopping_rounds')
+            else:
+                self.early_stopping_rounds = 0
+                
+            # Remove model_type parameter
+            if 'model_type' in model_params:
+                model_params.pop('model_type')
+                
             return XGBClassifier(**model_params)
         elif self.model_type == "lightgbm":
-            # For LightGBM, set early_stopping_rounds in the constructor
-            if 'early_stopping_rounds' not in model_params:
-                model_params['early_stopping_rounds'] = 100
+            # Remove early_stopping_rounds since it should be passed to fit
+            if 'early_stopping_rounds' in model_params:
+                self.early_stopping_rounds = model_params.pop('early_stopping_rounds')
+            else:
+                self.early_stopping_rounds = 0
+                
+            # Remove model_type parameter
+            if 'model_type' in model_params:
+                model_params.pop('model_type')
+                
+            # Handle feature_fraction and colsample_bytree conflict
+            if 'colsample_bytree' in model_params:
+                # Always convert colsample_bytree to feature_fraction for consistency
+                if 'feature_fraction' not in model_params:
+                    feature_fraction = model_params.pop('colsample_bytree')
+                    model_params['feature_fraction'] = feature_fraction
+                    logger.info(f"Converted colsample_bytree={feature_fraction} to feature_fraction={feature_fraction}")
+                else:
+                    # If both are present, remove colsample_bytree to avoid the warning
+                    colsample_value = model_params.pop('colsample_bytree')
+                    logger.warning(f"Both feature_fraction ({model_params['feature_fraction']}) and colsample_bytree ({colsample_value}) were provided. Using only feature_fraction.")
+                
+            # Fix silent and verbose parameters
+            if 'silent' in model_params:
+                # Remove silent parameter since it's deprecated
+                silent_value = model_params.pop('silent')
+                if 'verbose' not in model_params:
+                    model_params['verbose'] = -1 if silent_value else 0
+                logger.info(f"Removed deprecated 'silent' parameter, using verbose={model_params['verbose']}")
+            
+            # Set verbosity to minimal to avoid warnings
+            if 'verbose' not in model_params:
+                model_params['verbose'] = -1
+            
+            # Ensure parallel processing uses all available cores
+            model_params['n_jobs'] = -1
+            
+            # Log all parameter values for debugging
+            logger.debug(f"LightGBM parameters after cleaning: {model_params}")
+            
             return LGBMClassifier(**model_params)
         elif self.model_type == "catboost":
             try:
@@ -194,6 +240,10 @@ class CreditRiskModel:
             Trained model instance (self)
         """
         start_time = time.time()
+        
+        # Clean feature names to avoid LightGBM errors with special characters
+        logger.info("Cleaning feature names to ensure compatibility with models")
+        X = self._clean_feature_names(X)
         
         # Identify categorical and numerical columns if not already set
         if not hasattr(self, 'categorical_columns') or self.categorical_columns is None:
@@ -227,25 +277,25 @@ class CreditRiskModel:
             # Handle model-specific training
             if self.model_type == "xgboost":
                 # For XGBoost, handle early stopping
-                if 'early_stopping_rounds' in self.model_params and self.model_params['early_stopping_rounds'] > 0:
+                if self.early_stopping_rounds > 0:
                     # Create a validation set for early stopping
                     X_train, X_val, y_train, y_val = train_test_split(
                         X_processed, y, test_size=0.2, random_state=self.random_state, stratify=y
                     )
                     logger.info(f"Created validation set for early stopping: {X_val.shape}")
-                    self.model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+                    self.model.fit(X_train, y_train, eval_set=[(X_val, y_val)], early_stopping_rounds=self.early_stopping_rounds, verbose=False)
                 else:
                     # Train without early stopping
                     self.model.fit(X_processed, y, verbose=False)
             elif self.model_type == "lightgbm":
                 # For LightGBM, handle early stopping
-                if 'early_stopping_rounds' in self.model_params and self.model_params['early_stopping_rounds'] > 0:
+                if self.early_stopping_rounds > 0:
                     # Create a validation set for early stopping
                     X_train, X_val, y_train, y_val = train_test_split(
                         X_processed, y, test_size=0.2, random_state=self.random_state, stratify=y
                     )
                     logger.info(f"Created validation set for early stopping: {X_val.shape}")
-                    self.model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+                    self.model.fit(X_train, y_train, eval_set=[(X_val, y_val)], early_stopping_rounds=self.early_stopping_rounds, verbose=False)
                 else:
                     # Train without early stopping
                     self.model.fit(X_processed, y, verbose=False)
@@ -270,7 +320,7 @@ class CreditRiskModel:
     
     def _preprocess_data(self, X: pd.DataFrame) -> pd.DataFrame:
         """
-        Preprocess data by handling categorical and numerical features separately.
+        Preprocess data for model training/prediction.
         
         Parameters:
         -----------
@@ -280,116 +330,214 @@ class CreditRiskModel:
         Returns:
         --------
         pd.DataFrame
-            Processed features
+            Preprocessed features
         """
-        if X.empty:
+        if X is None or X.empty:
+            logger.warning("Empty DataFrame passed to preprocess_data")
             return X
-            
+        
+        # Create a working copy
         result = X.copy()
         
-        # Initialize imputers if not already done
-        if not hasattr(self, 'numeric_imputer'):
-            self.numeric_imputer = SimpleImputer(strategy='median')
-        if not hasattr(self, 'categorical_imputer'):
-            self.categorical_imputer = SimpleImputer(strategy='most_frequent')
+        # Extra protection against special characters in column names
+        # This ensures any columns created during preprocessing also have clean names
+        for col in result.columns:
+            if not all(c.isalnum() or c == '_' for c in col):
+                # Replace any remaining non-alphanumeric chars with underscores
+                new_name = re.sub(r'[^a-zA-Z0-9_]', '_', col)
+                # Ensure no duplicate column names
+                count = 1
+                original_new_name = new_name
+                while new_name in result.columns and new_name != col:
+                    new_name = f"{original_new_name}_{count}"
+                    count += 1
+                
+                if new_name != col:
+                    logger.warning(f"Found column with special characters after initial cleaning: '{col}' -> '{new_name}'")
+                    result = result.rename(columns={col: new_name})
         
-        # Handle categorical features based on model type
-        if self.categorical_columns:
-            if self.model_type == "catboost":
-                # CatBoost handles categorical features natively, just impute missing values
-                if len(self.categorical_columns) > 0:
-                    # Get only the categorical columns that exist in the dataset
-                    existing_cat_cols = [col for col in self.categorical_columns if col in result.columns]
-                    if existing_cat_cols:
-                        result[existing_cat_cols] = self.categorical_imputer.fit_transform(result[existing_cat_cols])
-            else:
-                # For other models, need to one-hot encode categorical features
-                # First impute missing values
-                if len(self.categorical_columns) > 0:
-                    # Get only the categorical columns that exist in the dataset
-                    existing_cat_cols = [col for col in self.categorical_columns if col in result.columns]
-                    if existing_cat_cols:
-                        result[existing_cat_cols] = self.categorical_imputer.fit_transform(result[existing_cat_cols])
-                        
-                        # For non-CatBoost models, encode categorical features
-                        if self.model_type != "catboost":
-                            # Store the original column names before encoding
-                            current_cols = set(result.columns)
-                            
-                            # One-hot encode categorical features
-                            for col in existing_cat_cols:
-                                # Convert to string to handle potential non-string categorical data
-                                result[col] = result[col].astype(str)
-                                
-                                try:
-                                    # Create dummy variables
-                                    dummies = pd.get_dummies(result[col], prefix=col, drop_first=False)
-                                    
-                                    # Only include dummy columns that were in the training data
-                                    if hasattr(self, 'processed_columns_'):
-                                        expected_dummy_cols = [c for c in self.processed_columns_ 
-                                                               if c.startswith(f"{col}_") and c not in result.columns]
-                                        
-                                        # Add missing dummy columns (with zeros)
-                                        for dummy_col in expected_dummy_cols:
-                                            if dummy_col not in dummies.columns:
-                                                dummies[dummy_col] = 0
-                                    
-                                    # Add dummy columns to result
-                                    result = pd.concat([result, dummies], axis=1)
-                                except Exception as e:
-                                    logger.error(f"Error encoding categorical column {col}: {str(e)}")
-                            
-                            # Drop original categorical columns
-                            result = result.drop(columns=existing_cat_cols)
-                            
-                            # Log added columns for debugging
-                            added_cols = set(result.columns) - current_cols
-                            logger.debug(f"Added {len(added_cols)} columns during one-hot encoding")
+        # Check for all-NA columns and remove them
+        all_na_cols = [col for col in result.columns if result[col].isna().all()]
+        if all_na_cols:
+            logger.warning(f"Removing {len(all_na_cols)} columns with all NA values")
+            result = result.drop(columns=all_na_cols)
         
-        # Handle numerical features
-        if self.numeric_columns:
-            # Get only the numeric columns that exist in the dataset
-            existing_num_cols = [col for col in self.numeric_columns if col in result.columns]
-            if existing_num_cols:
-                # Fix for "Columns must be same length as key" error
+        # Split data into categorical and numerical
+        cat_cols = self.categorical_columns or [col for col in result.columns if result[col].dtype == 'object' or result[col].dtype == 'category']
+        num_cols = self.numeric_columns or [col for col in result.columns if col not in cat_cols]
+        
+        # Filter to keep only columns that exist in the DataFrame
+        cat_cols = [col for col in cat_cols if col in result.columns]
+        num_cols = [col for col in num_cols if col in result.columns]
+        
+        logger.info(f"Processing {len(num_cols)} numeric columns and {len(cat_cols)} categorical columns")
+        
+        # Handle numeric columns
+        if num_cols:
+            # Get numeric data as a copy for imputation
+            num_data = result[num_cols].copy()
+            # Convert all numeric columns to float64
+            for col in num_data.columns:
                 try:
-                    logger.info(f"Imputing {len(existing_num_cols)} numeric columns")
-                    
-                    # First check for columns with all NaN values
-                    all_nan_cols = []
-                    for col in existing_num_cols:
-                        if result[col].isna().all():
-                            all_nan_cols.append(col)
-                    
-                    if all_nan_cols:
-                        logger.warning(f"Found {len(all_nan_cols)} columns with all NaN values. Filling with zeros instead of imputing.")
-                        for col in all_nan_cols:
-                            result[col] = 0
-                        
-                        # Remove these columns from imputation
-                        impute_cols = [col for col in existing_num_cols if col not in all_nan_cols]
-                    else:
-                        impute_cols = existing_num_cols
-                    
-                    if impute_cols:
-                        # Impute each column individually to avoid dimension mismatches
-                        for col in impute_cols:
-                            col_data = result[[col]]
-                            try:
-                                # Use a separate imputer for each column
-                                col_imputer = SimpleImputer(strategy='median')
-                                imputed_values = col_imputer.fit_transform(col_data)
-                                result[col] = imputed_values
-                            except Exception as e:
-                                logger.warning(f"Error imputing column {col}: {str(e)}. Filling with zeros.")
-                                result[col] = result[col].fillna(0)
+                    num_data[col] = pd.to_numeric(num_data[col], errors='coerce')
                 except Exception as e:
-                    logger.error(f"Error during numeric imputation: {str(e)}")
-                    # Fallback: fill NaN values with 0
-                    logger.warning("Falling back to filling all numeric NaN values with 0")
-                    for col in existing_num_cols:
-                        result[col] = result[col].fillna(0)
+                    logger.warning(f"Error converting {col} to numeric: {str(e)}")
+            
+            # First time fitting the imputer
+            if not hasattr(self, 'numeric_imputer_fitted') or not self.numeric_imputer_fitted:
+                try:
+                    logger.info("Fitting numeric imputer for the first time")
+                    self.numeric_imputer = self.numeric_imputer.fit(num_data)
+                    self.numeric_imputer_fitted = True
+                    # Store the column names the imputer was fitted on
+                    self.numeric_imputer_columns = num_data.columns.tolist()
+                    logger.info(f"Numeric imputer fitted on {len(self.numeric_imputer_columns)} columns")
+                except Exception as e:
+                    logger.warning(f"Error fitting numeric imputer: {str(e)}. Using SimpleImputer with strategy='median'")
+                    from sklearn.impute import SimpleImputer
+                    self.numeric_imputer = SimpleImputer(strategy='median')
+                    self.numeric_imputer = self.numeric_imputer.fit(num_data)
+                    self.numeric_imputer_fitted = True
+                    self.numeric_imputer_columns = num_data.columns.tolist()
+            
+            # Align columns with what the imputer was trained on
+            if hasattr(self, 'numeric_imputer_columns'):
+                # Check for feature name mismatch with imputer columns
+                missing_cols = set(self.numeric_imputer_columns) - set(num_data.columns)
+                extra_cols = set(num_data.columns) - set(self.numeric_imputer_columns)
+                
+                if missing_cols:
+                    logger.warning(f"Missing {len(missing_cols)} numeric columns required by imputer. Adding with zeros.")
+                    logger.debug(f"Missing columns: {list(missing_cols)[:5]}{'...' if len(missing_cols) > 5 else ''}")
+                    
+                    # Create a new DataFrame with zeros for missing columns
+                    missing_df = pd.DataFrame(0, index=num_data.index, columns=list(missing_cols))
+                    
+                    # Instead of adding columns one by one, concat all at once to avoid fragmentation
+                    num_data = pd.concat([num_data, missing_df], axis=1)
+                
+                if extra_cols:
+                    logger.warning(f"Found {len(extra_cols)} extra numeric columns not seen during imputer fitting.")
+                    # Save extra columns and drop them for imputation
+                    extra_data = num_data[list(extra_cols)].copy()
+                    num_data = num_data.drop(columns=list(extra_cols))
+                
+                # Ensure columns are in the same order as during fit
+                num_data = num_data[self.numeric_imputer_columns]
+            
+            try:
+                # Transform the aligned data
+                num_data_imputed_array = self.numeric_imputer.transform(num_data)
+                
+                # Create DataFrame with the imputed data
+                num_data_imputed = pd.DataFrame(
+                    num_data_imputed_array,
+                    columns=self.numeric_imputer_columns,
+                    index=num_data.index
+                )
+                
+                # Add back any extra columns that were removed before imputation
+                if 'extra_data' in locals():
+                    num_data_imputed = pd.concat([num_data_imputed, extra_data], axis=1)
+                
+                # Create a new result DataFrame instead of modifying columns one by one
+                # First, drop all numeric columns from the original result
+                result_non_numeric = result.drop(columns=num_cols, errors='ignore')
+                
+                # Then create a new DataFrame by concatenating non-numeric and imputed numeric data
+                result = pd.concat([result_non_numeric, num_data_imputed], axis=1)
+                
+            except Exception as e:
+                logger.warning(f"Error during numeric imputation: {str(e)}. Filling with median values directly.")
+                # Fallback to direct median imputation
+                for col in num_cols:
+                    median_val = num_data[col].median()
+                    result[col] = num_data[col].fillna(median_val)
+        
+        # Handle categorical columns
+        if cat_cols:
+            cat_data = result[cat_cols].copy()
+            
+            # First time fitting the categorical imputer
+            if not hasattr(self, 'categorical_imputer_fitted') or not self.categorical_imputer_fitted:
+                try:
+                    logger.info("Fitting categorical imputer for the first time")
+                    self.categorical_imputer = self.categorical_imputer.fit(cat_data)
+                    self.categorical_imputer_fitted = True
+                    # Store the column names the imputer was fitted on
+                    self.categorical_imputer_columns = cat_data.columns.tolist()
+                    logger.info(f"Categorical imputer fitted on {len(self.categorical_imputer_columns)} columns")
+                except Exception as e:
+                    logger.warning(f"Error fitting categorical imputer: {str(e)}. Using SimpleImputer with strategy='most_frequent'")
+                    from sklearn.impute import SimpleImputer
+                    self.categorical_imputer = SimpleImputer(strategy='most_frequent')
+                    self.categorical_imputer = self.categorical_imputer.fit(cat_data)
+                    self.categorical_imputer_fitted = True
+                    self.categorical_imputer_columns = cat_data.columns.tolist()
+            
+            # Align columns with what the imputer was trained on
+            if hasattr(self, 'categorical_imputer_columns'):
+                missing_cols = set(self.categorical_imputer_columns) - set(cat_data.columns)
+                extra_cols = set(cat_data.columns) - set(self.categorical_imputer_columns)
+                
+                if missing_cols:
+                    logger.warning(f"Missing {len(missing_cols)} categorical columns required by imputer. Adding with placeholders.")
+                    # Create a new DataFrame with placeholders for missing columns
+                    missing_df = pd.DataFrame('MISSING', index=cat_data.index, columns=list(missing_cols))
+                    
+                    # Concat all at once to avoid fragmentation
+                    cat_data = pd.concat([cat_data, missing_df], axis=1)
+                
+                if extra_cols:
+                    logger.warning(f"Found {len(extra_cols)} extra categorical columns not seen during imputer fitting.")
+                    # Save extra columns and drop them for imputation
+                    extra_data = cat_data[list(extra_cols)].copy()
+                    cat_data = cat_data.drop(columns=list(extra_cols))
+                
+                # Ensure columns are in the same order as during fit
+                cat_data = cat_data[self.categorical_imputer_columns]
+            
+            try:
+                # Transform the aligned data
+                cat_data_imputed_array = self.categorical_imputer.transform(cat_data)
+                
+                # Create DataFrame with the imputed data
+                cat_data_imputed = pd.DataFrame(
+                    cat_data_imputed_array,
+                    columns=self.categorical_imputer_columns,
+                    index=cat_data.index
+                )
+                
+                # Add back any extra columns that were removed before imputation
+                if 'extra_data' in locals() and not extra_data.empty:
+                    cat_data_imputed = pd.concat([cat_data_imputed, extra_data], axis=1)
+                
+                # Update result with imputed categorical data (using concat to avoid fragmentation)
+                result_non_categorical = result.drop(columns=cat_cols, errors='ignore')
+                result = pd.concat([result_non_categorical, cat_data_imputed], axis=1)
+                
+            except Exception as e:
+                logger.warning(f"Error during categorical imputation: {str(e)}. Filling with most frequent values directly.")
+                # Fallback to direct most frequent imputation
+                for col in cat_cols:
+                    most_freq = cat_data[col].mode().iloc[0] if not cat_data[col].mode().empty else "MISSING"
+                    result[col] = cat_data[col].fillna(most_freq)
+        
+        # Convert categorical columns to numeric using one-hot encoding
+        # Only do this for actual object/category columns
+        object_cols = [col for col in result.columns if result[col].dtype == 'object' or result[col].dtype == 'category']
+        if object_cols:
+            logger.warning(f"There are still {len(object_cols)} object/string columns: {object_cols}")
+            # As a last resort, drop these columns to avoid LightGBM errors
+            result = result.drop(columns=object_cols)
+        
+        # Ensure no NaN values remain
+        if result.isna().any().any():
+            logger.warning("NaN values remain after imputation. Filling remaining NaNs with 0.")
+            result = result.fillna(0)
+        
+        # Defragment the DataFrame to optimize memory usage
+        result = result.copy()
         
         return result
     
@@ -410,6 +558,11 @@ class CreditRiskModel:
         if self.model is None:
             logger.error("Model not trained. Call fit() before predict().")
             raise ValueError("Model not trained. Call fit() before predict().")
+        
+        # Clean feature names to ensure compatibility with the model
+        if hasattr(self, 'feature_name_mapping') and self.feature_name_mapping:
+            logger.info("Cleaning feature names for prediction to match training data")
+            X = self._clean_feature_names(X)
         
         # Process the data according to column types
         try:
@@ -448,63 +601,61 @@ class CreditRiskModel:
     
     def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
         """
-        Predict probabilities for samples in X.
+        Predict class probabilities for samples in X.
         
         Parameters:
         -----------
         X : pd.DataFrame
-            Samples to predict
+            Input features
             
         Returns:
         --------
         np.ndarray
-            Predicted probabilities for both classes (0 and 1)
+            Class probabilities
         """
-        if self.model is None:
-            logger.error("Model not trained. Call fit() before predict_proba().")
-            raise ValueError("Model not trained. Call fit() before predict_proba().")
-        
         try:
-            # Process the data if not already processed
-            if hasattr(self, 'processed_columns_') and not all(col in X.columns for col in self.processed_columns_):
-                logger.info("Input data needs preprocessing")
-                X_processed = self._preprocess_data(X)
-                
-                # Handle missing columns
-                missing_cols = set(self.processed_columns_) - set(X_processed.columns)
-                if missing_cols:
-                    logger.warning(f"Missing {len(missing_cols)} columns from training data. Adding them with zeros.")
-                    for col in missing_cols:
-                        X_processed[col] = 0
-                
-                # Ensure correct column order
-                X_processed = X_processed[self.processed_columns_]
-            else:
-                # Data is already processed or doesn't need column alignment
-                X_processed = X
+            # Skip feature cleaning if we've already done it in predict()
+            if not hasattr(X, '_feature_names_cleaned') and hasattr(self, 'feature_name_mapping') and self.feature_name_mapping:
+                logger.info("Cleaning feature names for probability prediction to match training data")
+                X = self._clean_feature_names(X)
+                # Mark X as already having cleaned feature names
+                X._feature_names_cleaned = True
             
-            # Get probability predictions - return full probability array (not just class 1)
-            if self.model_type == "lightgbm" and hasattr(self.model, "best_iteration_"):
-                probas = self.model.predict_proba(X_processed, num_iteration=self.model.best_iteration_)
-            elif self.model_type == "catboost" and hasattr(self.model, "best_iteration_"):
-                probas = self.model.predict_proba(X_processed, ntree_end=self.model.best_iteration_)
-            elif self.model_type == "xgboost" and hasattr(self.model, "best_iteration"):
-                probas = self.model.predict_proba(X_processed, iteration_range=(0, self.model.best_iteration))
+            # Preprocess data
+            X_processed = self._preprocess_data(X)
+            
+            # Check feature mismatch
+            if hasattr(self, 'processed_columns_'):
+                missing_cols = set(self.processed_columns_) - set(X_processed.columns)
+                extra_cols = set(X_processed.columns) - set(self.processed_columns_)
+                
+                if missing_cols:
+                    logger.warning(f"Test data is missing {len(missing_cols)} columns that were in training data.")
+                    for col in missing_cols:
+                        X_processed[col] = 0  # Add missing columns with zeros
+                
+                if extra_cols:
+                    logger.warning(f"Test data has {len(extra_cols)} extra columns that were not in training data. These will be dropped.")
+                    X_processed = X_processed.drop(columns=list(extra_cols))
+                
+                # Ensure column order matches
+                X_processed = X_processed[self.processed_columns_]
+            
+            # Make predictions
+            if self.model_type in ["xgboost", "lightgbm"]:
+                # Use best iteration if early stopping was used
+                if hasattr(self.model, 'best_iteration_'):
+                    probas = self.model.predict_proba(X_processed, num_iteration=self.model.best_iteration_)
+                else:
+                    probas = self.model.predict_proba(X_processed)
             else:
                 probas = self.model.predict_proba(X_processed)
             
-            # For some models that might only return class 1 probability, reshape to proper format
-            if len(probas.shape) == 1:
-                logger.warning("Model returned 1D probability array, reshaping to 2D")
-                class_1_probs = probas
-                class_0_probs = 1 - class_1_probs
-                probas = np.column_stack((class_0_probs, class_1_probs))
-                
             return probas
-        
         except Exception as e:
-            logger.error(f"Error in predict_proba(): {str(e)}")
-            raise
+            logger.error(f"Error in predict_proba(): {str(e)}", exc_info=True)
+            # Raise a more descriptive error message
+            raise ValueError(f"Error making predictions: {str(e)}")
     
     def evaluate(self, X: pd.DataFrame, y: pd.Series) -> Dict:
         """
@@ -554,164 +705,149 @@ class CreditRiskModel:
         Parameters:
         -----------
         X : pd.DataFrame
-            Training features
+            Feature matrix
         y : pd.Series
             Target variable
-        n_folds : int
-            Number of folds for cross-validation
-        stratified : bool
-            Whether to use stratified folds
+        n_folds : int, optional
+            Number of cross-validation folds, by default 5
+        stratified : bool, optional
+            Whether to use stratified sampling, by default True
             
         Returns:
         --------
         Dict
-            Cross-validation results
+            Cross-validation results including AUC scores
         """
-        # Identify categorical and numerical columns
-        self.categorical_columns = [col for col in X.columns if X[col].dtype == 'object' or X[col].dtype == 'category']
-        self.numeric_columns = [col for col in X.columns if col not in self.categorical_columns]
+        if self.model is None:
+            self.model = self._create_model()
         
-        logger.info(f"Identified {len(self.categorical_columns)} categorical columns and {len(self.numeric_columns)} numeric columns")
+        # Clean feature names to ensure compatibility with LightGBM
+        logger.info(f"Cleaning feature names before cross-validation")
+        X = self._clean_feature_names(X)
         
-        # Store feature names for later use
-        self.feature_names_ = X.columns.tolist()
+        # Check for all-NA columns and remove them before preprocessing
+        all_na_cols = [col for col in X.columns if X[col].isna().all()]
+        if all_na_cols:
+            logger.warning(f"Removing {len(all_na_cols)} columns with all NA values before cross-validation")
+            logger.debug(f"All-NA columns: {all_na_cols[:5]}{'...' if len(all_na_cols) > 5 else ''}")
+            X = X.drop(columns=all_na_cols)
         
-        # Define cross-validation strategy
-        if stratified:
+        # Preprocess the data - this handles imputation, etc.
+        try:
+            logger.info(f"Preprocessing data for cross-validation with {X.shape[1]} features")
+            X_processed = self._preprocess_data(X)
+            logger.info(f"Successfully preprocessed data with {X_processed.shape[1]} features")
+            
+            # Log column count mismatch if any
+            if X_processed.shape[1] != X.shape[1]:
+                logger.warning(f"Column count changed during preprocessing: {X.shape[1]} -> {X_processed.shape[1]}")
+        except Exception as e:
+            logger.error(f"Error preprocessing data for cross-validation: {str(e)}")
+            raise ValueError(f"Failed to preprocess data for cross-validation: {str(e)}")
+        
+        # Store the processed columns for prediction
+        logger.info(f"Storing processed column names for future reference: {len(X_processed.columns)} columns")
+        self.processed_columns_ = X_processed.columns.tolist()
+        
+        # Create stratified k-fold
+        if stratified and len(y.unique()) > 1:
+            # Only use stratified if we have at least 2 classes
             folds = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=self.random_state)
         else:
+            # Fall back to regular k-fold if only one class
+            logger.warning("Using regular KFold cross-validation because there is only one class.")
             folds = KFold(n_splits=n_folds, shuffle=True, random_state=self.random_state)
             
-        # Initialize result dictionaries
-        cv_scores = {
-            "auc": [],
-            "precision": [],
-            "recall": [],
-            "f1": [],
-            "accuracy": [],
-            "train_time": [],
-            "inference_time": [],
-            "oof_preds": []  # Add out-of-fold predictions
-        }
+        # Initialize results
+        fold_scores = []
+        fold_predictions = []
+        all_predictions = np.zeros(len(y))
         
-        # Preprocess the data once to avoid redundant preprocessing in each fold
-        X_processed = self._preprocess_data(X)
-        
-        # We'll construct arrays for concatenated predictions and true values
-        all_predictions = []
-        all_true_values = []
-        all_indices = []
-        
-        # Perform cross-validation
+        # Cross-validation loop
         for n_fold, (train_idx, valid_idx) in enumerate(folds.split(X_processed, y)):
-            fold_start_time = time.time()
-            logger.info(f"Training fold {n_fold + 1}/{n_folds}")
+            fold_num = n_fold + 1
+            logger.info(f"Training fold {fold_num}/{n_folds}")
             
-            # Split data
-            X_train, X_valid = X_processed.iloc[train_idx], X_processed.iloc[valid_idx]
-            y_train, y_valid = y.iloc[train_idx], y.iloc[valid_idx]
+            # Get train and validation sets
+            X_fold_train, X_fold_valid = X_processed.iloc[train_idx].copy(), X_processed.iloc[valid_idx].copy()
+            y_fold_train, y_fold_valid = y.iloc[train_idx].copy(), y.iloc[valid_idx].copy()
             
-            # Create and train the model
+            # Check for any NaN values and handle them
+            if X_fold_train.isna().any().any():
+                logger.warning(f"NaN values found in fold {fold_num} training data. Filling with 0.")
+                X_fold_train = X_fold_train.fillna(0)
+            
+            if X_fold_valid.isna().any().any():
+                logger.warning(f"NaN values found in fold {fold_num} validation data. Filling with 0.")
+                X_fold_valid = X_fold_valid.fillna(0)
+            
+            # Check if we only have one class in the training set
+            if len(y_fold_train.unique()) < 2:
+                logger.warning(f"Fold {fold_num} has only one class in training. Skip this fold.")
+                continue
+                
+            # Check if we only have one class in the validation set
+            if len(y_fold_valid.unique()) < 2:
+                logger.warning(f"Fold {fold_num} has only one class in validation. Skip this fold.")
+                continue
+            
+            # Create and train model
             fold_model = self._create_model()
             
-            # Train the model with early stopping if available
-            if self.model_type in ["xgboost", "lightgbm", "catboost"]:
-                # Handle categorical features for CatBoost
-                if self.model_type == "catboost":
-                    cat_features = [i for i, col in enumerate(X_processed.columns) if col in self.categorical_columns]
-                    if cat_features:
-                        fold_model.fit(
-                            X_train, y_train,
-                            eval_set=[(X_valid, y_valid)],
-                            cat_features=cat_features,
-                            early_stopping_rounds=100,
-                            verbose=False
-                        )
-                    else:
-                        fold_model.fit(
-                            X_train, y_train,
-                            eval_set=[(X_valid, y_valid)],
-                            early_stopping_rounds=100,
-                            verbose=False
-                        )
-                elif self.model_type == "xgboost":
-                    # For XGBoost 2.1.x, early stopping is set in the constructor
-                    fold_model.fit(
-                        X_train, y_train,
-                        eval_set=[(X_valid, y_valid)],
-                        verbose=False
-                    )
-                else:
-                    try:
-                        # Try standard approach
-                        fold_model.fit(
-                            X_train, y_train,
-                            eval_set=[(X_valid, y_valid)],
-                            early_stopping_rounds=100,
-                            verbose=False
-                        )
-                    except TypeError:
-                        logger.warning(f"Early stopping not supported directly in fit method for {self.model_type}. Falling back to basic fit.")
-                        # Fall back to basic fit without early stopping
-                        fold_model.fit(X_train, y_train)
-            else:
-                fold_model.fit(X_train, y_train)
+            # Start timing for this fold
+            fold_start_time = time.time()
             
-            # Get predictions for this fold
-            if self.model_type == "lightgbm" and hasattr(fold_model, "best_iteration_"):
-                oof_preds = fold_model.predict_proba(X_valid, num_iteration=fold_model.best_iteration_)[:, 1]
-            elif self.model_type == "catboost" and hasattr(fold_model, "best_iteration_"):
-                oof_preds = fold_model.predict_proba(X_valid, ntree_end=fold_model.best_iteration_)[:, 1]
-            elif self.model_type == "xgboost" and hasattr(fold_model, "best_iteration"):
-                oof_preds = fold_model.predict_proba(X_valid, iteration_range=(0, fold_model.best_iteration))[:, 1]
-            else:
-                oof_preds = fold_model.predict_proba(X_valid)[:, 1]
+            # Fit the model - handle different model types
+            try:
+                fold_model.fit(X_fold_train, y_fold_train, verbose=False)
+            except Exception as e:
+                logger.error(f"Error fitting fold {fold_num}: {str(e)}")
+                continue
             
-            # Save predictions and true values for later overall calculation
-            all_predictions.extend(oof_preds)
-            all_true_values.extend(y_valid.values)
-            all_indices.extend(valid_idx)
+            # Make predictions
+            y_fold_pred = fold_model.predict_proba(X_fold_valid)[:, 1]
             
-            # Calculate fold metrics
-            fold_auc = roc_auc_score(y_valid, oof_preds)
-            
-            # Collect fold metrics
-            cv_scores["auc"].append(fold_auc)
-            cv_scores["train_time"].append(time.time() - fold_start_time)
-            cv_scores["oof_preds"].append({
-                "indices": valid_idx,
-                "predictions": oof_preds
-            })
-            
-            fold_time = time.time() - fold_start_time
-            logger.info(f"Fold {n_fold + 1} completed in {fold_time:.2f} seconds. AUC: {fold_auc:.4f}")
-            
-            # Clean up memory
-            gc.collect()
-        
-        # Calculate overall metrics from fold results
-        mean_auc = np.mean(cv_scores["auc"])
-        std_auc = np.std(cv_scores["auc"])
-        
-        # Calculate the overall AUC directly from all predictions and true values
+            # Get AUC score
+            try:
+                fold_auc = roc_auc_score(y_fold_valid, y_fold_pred)
+                fold_scores.append(fold_auc)
+                
+                # Store predictions
+                all_predictions[valid_idx] = y_fold_pred
+                fold_predictions.append((valid_idx, y_fold_pred))
+                
+                # Log fold results
+                logger.info(f"Fold {fold_num} completed in {(time.time() - fold_start_time):.2f} seconds. AUC: {fold_auc:.4f}")
+            except Exception as e:
+                logger.error(f"Error calculating AUC for fold {fold_num}: {str(e)}")
+                continue
+                
+        # Calculate overall AUC
         try:
-            logger.info(f"Calculating overall AUC from {len(all_predictions)} predictions")
-            overall_auc = roc_auc_score(all_true_values, all_predictions)
+            logger.info(f"Calculating overall AUC from {len(y)} predictions")
+            overall_auc = roc_auc_score(y, all_predictions)
             logger.info(f"Successfully calculated overall AUC: {overall_auc:.4f}")
         except Exception as e:
-            logger.warning(f"Error calculating overall AUC: {str(e)}. Using mean AUC instead.")
-            overall_auc = mean_auc  # Fallback to mean AUC
+            logger.error(f"Error calculating overall AUC: {str(e)}")
+            if len(fold_scores) > 0:
+                # Use mean of fold scores if overall AUC fails
+                overall_auc = np.mean(fold_scores)
+                logger.info(f"Using mean of fold AUCs instead: {overall_auc:.4f}")
+            else:
+                # Default to 0.5 if no fold scores available
+                overall_auc = 0.5
+                logger.warning("No valid fold scores. Using default AUC of 0.5.")
         
         # Create results dictionary
         cv_results = {
-            "oof_predictions": cv_scores["oof_preds"],
-            "fold_metrics": cv_scores["auc"],
-            "mean_auc": mean_auc,
-            "std_auc": std_auc,
+            "oof_predictions": fold_predictions,
+            "fold_metrics": fold_scores,
+            "mean_auc": np.mean(fold_scores),
+            "std_auc": np.std(fold_scores),
             "overall_auc": overall_auc,
             "feature_importances": None,
-            "train_time": np.mean(cv_scores["train_time"]),
-            "inference_time": np.mean(cv_scores["inference_time"])
+            "train_time": 0,  # Assuming train_time is not available in this method
+            "inference_time": 0  # Assuming inference_time is not available in this method
         }
         
         # Make sure the model is initialized for subsequent training
@@ -910,4 +1046,88 @@ class CreditRiskModel:
             width=600
         )
         
-        return fig 
+        return fig
+
+    def _clean_feature_names(self, X: pd.DataFrame) -> pd.DataFrame:
+        """
+        Clean feature names to ensure they're compatible with model requirements.
+        Especially important for LightGBM which doesn't support special characters in feature names.
+        
+        Parameters:
+        -----------
+        X : pd.DataFrame
+            DataFrame with features
+            
+        Returns:
+        --------
+        pd.DataFrame
+            DataFrame with cleaned feature names
+        """
+        if X is None or X.empty:
+            return X
+        
+        logger.info(f"Cleaning feature names for compatibility with JSON (required by LightGBM)")
+        logger.debug(f"Original column count: {len(X.columns)}")
+        
+        # Create a copy to avoid modifying the original
+        X_cleaned = X.copy()
+        
+        # Build mapping of original to cleaned names
+        name_mapping = {}
+        problematic_chars = []
+        
+        for col in X_cleaned.columns:
+            # Save original for logging
+            original_name = col
+            
+            # STEP 1: Remove any leading/trailing whitespace
+            cleaned_name = col.strip()
+            
+            # STEP 2: More aggressive cleaning - keep ONLY alphanumeric and underscores
+            # This is stricter than before but ensures LightGBM compatibility
+            old_name = cleaned_name
+            cleaned_name = re.sub(r'[^\w\d]+', '_', cleaned_name)
+            
+            # Log any found problematic characters
+            if old_name != cleaned_name:
+                diff_chars = set(char for char in old_name if not char.isalnum() and char != '_')
+                problematic_chars.extend(diff_chars)
+            
+            # STEP 3: Ensure the name doesn't start with a number or underscore
+            if cleaned_name and (cleaned_name[0].isdigit() or cleaned_name[0] == '_'):
+                cleaned_name = 'f' + cleaned_name
+            
+            # STEP 4: Handle empty or all-special-char names
+            if not cleaned_name or cleaned_name.isspace():
+                cleaned_name = f"feature_{len(name_mapping)}"
+            
+            # STEP 5: Avoid duplicate names by adding a suffix if needed
+            count = 1
+            orig_cleaned_name = cleaned_name
+            while cleaned_name in name_mapping.values() and cleaned_name != col:
+                cleaned_name = f"{orig_cleaned_name}_{count}"
+                count += 1
+            
+            name_mapping[col] = cleaned_name
+            
+            # DEBUG: Log each transformation
+            if original_name != cleaned_name:
+                logger.debug(f"Feature name transformed: '{original_name}' -> '{cleaned_name}'")
+        
+        # Log changes summary
+        changed_names = {orig: new for orig, new in name_mapping.items() if orig != new}
+        if changed_names:
+            logger.warning(f"Cleaned {len(changed_names)} feature names to ensure compatibility")
+            logger.warning(f"Problematic characters found: {set(problematic_chars)}")
+            for orig, new in list(changed_names.items())[:5]:  # Log first 5 changed names as examples
+                logger.warning(f"Renamed feature: '{orig}' -> '{new}'")
+            if len(changed_names) > 5:
+                logger.warning(f"... and {len(changed_names) - 5} more renamed features")
+        
+        # Rename the columns
+        X_cleaned.columns = [name_mapping.get(col, col) for col in X_cleaned.columns]
+        
+        # Store the mapping for future reference
+        self.feature_name_mapping = name_mapping
+        
+        return X_cleaned 

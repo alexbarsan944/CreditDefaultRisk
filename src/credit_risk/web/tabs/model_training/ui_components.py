@@ -214,7 +214,8 @@ def display_model_params(model_type, use_gpu=False):
             "colsample_bytree": colsample_bytree,
             "early_stopping_rounds": 100,  # Early stopping
             "verbose": -1,  # Quiet mode
-            "silent": True  # Silent mode
+            "silent": True,  # Silent mode
+            "n_jobs": -1  # Use all CPU cores
         }
         
     elif model_type == "catboost":

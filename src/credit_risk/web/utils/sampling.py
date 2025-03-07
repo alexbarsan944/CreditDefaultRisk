@@ -92,6 +92,12 @@ def apply_sampling_profile(
         # Determine sample size for this dataset
         sample_size = min(profile["sample_size"], df.shape[0])
         
+        # If sample_size is the same as df size, just use the original dataset
+        if sample_size == df.shape[0]:
+            logger.info(f"Sample size equals dataset size for {name}, using original dataset")
+            sampled_datasets[name] = df
+            continue
+        
         if use_stratified:
             logger.info(f"Applying stratified sampling to {name} with size {sample_size}")
             # Just take the first part from stratified split to maintain class distribution

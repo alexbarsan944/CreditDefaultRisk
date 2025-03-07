@@ -335,14 +335,21 @@ def render_prediction_tab():
     feature_selector = None
     
     if model_source == "Use model from previous step":
-        if "model_results" in st.session_state:
-            model = st.session_state.model_results["model"]
-            feature_selector = st.session_state.model_results.get("feature_selector")
-            model_type = st.session_state.model_results["model_type"]
-            
-            st.success(f"Using {model_type.upper()} model from previous step")
+        # Check if model_results exists and is not None
+        if "model_results" in st.session_state and st.session_state.model_results is not None:
+            # Check if model key exists in model_results
+            if "model" in st.session_state.model_results:
+                model = st.session_state.model_results["model"]
+                feature_selector = st.session_state.model_results.get("feature_selector")
+                model_type = st.session_state.model_results["model_type"]
+                
+                st.success(f"Using {model_type.upper()} model from previous step")
+            else:
+                st.warning("Model results found but no model available. Please train a model first.")
+                return
         else:
             st.warning("No model found from previous step. Please train a model first or load a saved model.")
+            return
     else:
         # Check for saved models in the step_data directory
         available_data = get_available_step_data()
